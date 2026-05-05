@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, SpeakOptions};
 use crate::clone;
+use crate::daemon;
 use crate::db;
 use crate::pack;
 #[cfg(target_os = "macos")]
@@ -539,7 +540,16 @@ fn tool_speak(args: &Value) -> ToolResult {
     };
 
     let start = std::time::Instant::now();
-    if let Err(e) = bk.speak(text, &opts) {
+    let is_heavy = matches!(
+        effective_backend.as_str(),
+        "voxtream" | "qwen" | "qwen-native" | "kokoro"
+    );
+    let speak_result = if is_heavy && daemon::is_running() {
+        daemon::speak_via_daemon(text, &effective_backend, &opts)
+    } else {
+        bk.speak(text, &opts)
+    };
+    if let Err(e) = speak_result {
         return tool_err(format!("speak error: {e}"));
     }
     let duration_ms = start.elapsed().as_millis() as u64;
