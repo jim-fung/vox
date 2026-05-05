@@ -28,6 +28,7 @@ use crate::config;
 const DEFAULT_PORT: u16 = 19876;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const VOXTREAM_SERVER_PORT: u16 = 7860;
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub fn daemon_port() -> u16 {
     std::env::var("VOX_DAEMON_PORT")
@@ -198,7 +199,10 @@ import json, sys, numpy as np, soundfile as sf
 from websockets.sync.client import connect
 ws = connect("ws://127.0.0.1:{port}/voxtream", close_timeout=5)
 try:
-    ws.send(json.dumps({{"event": "init", "prompt_audio_path": "{prompt}", "text": "{text}"}}))
+    prompt_audio_path = sys.argv[1]
+    text = sys.argv[2]
+    output_path = sys.argv[3]
+    ws.send(json.dumps({{"event": "init", "prompt_audio_path": prompt_audio_path, "text": text}}))
     sr = 24000
     frames = []
     while True:
@@ -215,7 +219,7 @@ try:
             elif data.get("type") in ("eos", "done", "error"):
                 break
     if frames:
-        sf.write("{output}", np.concatenate(frames), sr)
+        sf.write(output_path, np.concatenate(frames), sr)
 finally:
     try:
         ws.close()
@@ -223,9 +227,6 @@ finally:
         pass
 "#,
             port = VOXTREAM_SERVER_PORT,
-            prompt = prompt_audio.replace('"', r#"\""#),
-            text = text.replace('"', r#"\""#).replace('\n', " "),
-            output = output_wav.replace('"', r#"\""#),
         );
 
         let python = find_voxtream()
@@ -239,6 +240,9 @@ finally:
         let output = Command::new(&python)
             .arg("-c")
             .arg(&script)
+            .arg(prompt_audio)
+            .arg(text)
+            .arg(output_wav)
             .output()
             .context("failed to run voxtream WebSocket client")?;
 
@@ -387,6 +391,18 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<DaemonState
         let lower = line.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
+            if content_length > MAX_REQUEST_BODY_BYTES {
+                let response_body =
+                    serde_json::json!({"error": "request body too large"}).to_string();
+                let http = format!(
+                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                writer.write_all(http.as_bytes()).await?;
+                writer.flush().await?;
+                return Ok(());
+            }
         }
     }
 
