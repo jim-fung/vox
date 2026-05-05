@@ -2,12 +2,39 @@
 //!
 //! Supports blocking and async (threaded) playback of WAV/MP3/OGG/FLAC files.
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::thread;
 
 use anyhow::{Context, Result};
+use rodio::buffer::SamplesBuffer;
+use rodio::{OutputStream, OutputStreamHandle, Sink};
+
+struct AudioOutput {
+    _stream: OutputStream,
+    handle: OutputStreamHandle,
+}
+
+thread_local! {
+    static AUDIO_OUTPUT: RefCell<Option<AudioOutput>> = const { RefCell::new(None) };
+}
+
+fn with_audio_handle<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&OutputStreamHandle) -> Result<R>,
+{
+    AUDIO_OUTPUT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            let (_stream, handle) =
+                OutputStream::try_default().context("Failed to open audio output device")?;
+            *borrow = Some(AudioOutput { _stream, handle });
+        }
+        f(&borrow.as_ref().unwrap().handle)
+    })
+}
 
 /// Apply volume gain to a WAV file in-place by rewriting the sample data.
 /// A volume of 1.0 leaves the file unchanged.
@@ -54,6 +81,29 @@ pub fn apply_wav_gain(path: &Path, volume: f32) -> Result<()> {
     Ok(())
 }
 
+/// Play mono f32 samples and block until playback finishes.
+pub fn play_samples_blocking(samples: Vec<f32>, sample_rate: u32, volume: f32) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    let samples = if (volume - 1.0).abs() > f32::EPSILON {
+        samples
+            .into_iter()
+            .map(|sample| (sample * volume).clamp(-1.0, 1.0))
+            .collect()
+    } else {
+        samples
+    };
+
+    with_audio_handle(|handle| {
+        let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
+        sink.append(SamplesBuffer::new(1, sample_rate, samples));
+        sink.sleep_until_end();
+        Ok(())
+    })
+}
+
 /// Play a WAV file and block until playback finishes.
 pub fn play_wav_blocking(path: &Path) -> Result<()> {
     play_audio_blocking(path)
@@ -61,15 +111,15 @@ pub fn play_wav_blocking(path: &Path) -> Result<()> {
 
 /// Play an audio file (WAV, MP3, OGG, FLAC) and block until playback finishes.
 pub fn play_audio_blocking(path: &Path) -> Result<()> {
-    let (_stream, stream_handle) =
-        rodio::OutputStream::try_default().context("Failed to open audio output device")?;
     let file = File::open(path).context("Failed to open audio file")?;
     let source =
         rodio::Decoder::new(BufReader::new(file)).context("Failed to decode audio file")?;
-    let sink = rodio::Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
-    sink.append(source);
-    sink.sleep_until_end();
-    Ok(())
+    with_audio_handle(|handle| {
+        let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
+        sink.append(source);
+        sink.sleep_until_end();
+        Ok(())
+    })
 }
 
 /// Handle for async WAV playback — keeps audio alive until `wait()` or drop.
