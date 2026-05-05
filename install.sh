@@ -68,12 +68,36 @@ install() {
     info "Version: $VERSION"
 
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}-${TARGET}.tar.gz"
+    CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
     TEMP_DIR=$(mktemp -d)
     ARCHIVE="${TEMP_DIR}/${BINARY_NAME}.tar.gz"
+    CHECKSUMS="${TEMP_DIR}/checksums.txt"
+    ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.tar.gz"
 
     info "Downloading from: $DOWNLOAD_URL"
     if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
         error "Failed to download binary"
+    fi
+
+    info "Downloading checksums..."
+    if ! curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUMS"; then
+        error "Failed to download checksums"
+    fi
+
+    info "Verifying checksum..."
+    EXPECTED=$(grep " ${ARCHIVE_NAME}$" "$CHECKSUMS" | awk '{print $1}')
+    if [ -z "$EXPECTED" ]; then
+        error "Checksum for ${ARCHIVE_NAME} not found"
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+    else
+        error "sha256sum or shasum is required to verify the download"
+    fi
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        error "Checksum verification failed"
     fi
 
     info "Extracting..."
