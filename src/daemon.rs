@@ -69,8 +69,15 @@ pub fn remove_pid() {
 
 // ── Health check (client side) ───────────────────────────────
 
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 pub fn is_running() -> bool {
-    reqwest::blocking::Client::new()
+    http_client()
         .get(daemon_url("/health"))
         .timeout(Duration::from_millis(500))
         .send()
@@ -120,6 +127,7 @@ struct HealthResponse {
     status: String,
     uptime_secs: u64,
     loaded_backends: Vec<String>,
+    available_backends: Vec<String>,
     pid: u32,
 }
 
@@ -303,6 +311,18 @@ impl DaemonState {
         backends
     }
 
+    async fn available_backends(&self) -> Vec<String> {
+        let mut available = Vec::new();
+        for name in &["say", "kokoro", "piper", "qwen-native", "voxtream"] {
+            if let Ok(b) = backend::get_backend(name)
+                && b.is_available()
+            {
+                available.push((*name).to_string());
+            }
+        }
+        available
+    }
+
     /// Ensure voxtream-server is running, start if needed.
     async fn ensure_voxtream_server(&self) -> Result<()> {
         let mut server = self.voxtream_server.lock().await;
@@ -436,6 +456,7 @@ async fn route(
                 "status": "ok",
                 "uptime_secs": state.uptime_secs(),
                 "loaded_backends": state.loaded_backends().await,
+                "available_backends": state.available_backends().await,
                 "pid": std::process::id(),
             });
             ("200 OK", resp.to_string())
@@ -552,6 +573,87 @@ async fn route(
                 }
             }
         }
+        ("POST", "/preload") => {
+            let req: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let resp = serde_json::json!({"success": false, "error": format!("invalid JSON: {e}")});
+                    return ("400 Bad Request", resp.to_string());
+                }
+            };
+            let backend_name = req.get("backend").and_then(|v| v.as_str()).unwrap_or("all");
+            state.touch();
+
+            let backends_to_load: Vec<&str> = if backend_name == "all" {
+                vec!["kokoro", "qwen-native", "piper"]
+            } else {
+                vec![backend_name]
+            };
+
+            let mut loaded = Vec::new();
+            let mut errors = Vec::new();
+
+            for name in &backends_to_load {
+                let result = match *name {
+                    "kokoro" => {
+                        tokio::task::spawn_blocking(move || {
+                            let b = backend::get_backend("kokoro")?;
+                            let empty_opts = SpeakOptions {
+                                voice: None,
+                                lang: None,
+                                rate: None,
+                                gender: None,
+                                style: None,
+                                ref_audio: None,
+                                ref_text: None,
+                                model: None,
+                                volume: 1.0,
+                            };
+                            b.speak("", &empty_opts).map_err(|e| anyhow::anyhow!("{e}"))
+                        })
+                        .await
+                    }
+                    "qwen-native" => {
+                        tokio::task::spawn_blocking(|| {
+                            crate::backend::qwen_native::preload_model(None)
+                        })
+                        .await
+                    }
+                    "piper" => {
+                        tokio::task::spawn_blocking(|| {
+                            let _ = backend::get_backend("piper")?;
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await
+                    }
+                    _ => {
+                        errors.push(format!("unknown backend: {name}"));
+                        continue;
+                    }
+                };
+
+                match result {
+                    Ok(Ok(_)) => {
+                        eprintln!("[daemon] Preloaded {name}");
+                        loaded.push((*name).to_string());
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[daemon] Failed to preload {name}: {e:#}");
+                        errors.push(format!("{name}: {e:#}"));
+                    }
+                    Err(e) => {
+                        errors.push(format!("{name}: task panicked: {e}"));
+                    }
+                }
+            }
+
+            let resp = serde_json::json!({
+                "success": errors.is_empty(),
+                "loaded": loaded,
+                "errors": errors,
+            });
+            ("200 OK", resp.to_string())
+        }
         ("POST", "/shutdown") => {
             eprintln!("[daemon] Shutdown requested.");
             tokio::spawn(async {
@@ -586,10 +688,9 @@ pub fn speak_via_daemon(text: &str, backend: &str, opts: &SpeakOptions) -> Resul
         volume: opts.volume,
     };
 
-    let resp: SpeakResponse = reqwest::blocking::Client::new()
+    let resp: SpeakResponse = http_client()
         .post(daemon_url("/speak"))
         .json(&req)
-        .timeout(Duration::from_secs(120))
         .send()
         .context("failed to connect to vox daemon")?
         .json()
@@ -651,7 +752,7 @@ pub fn handle_stop() -> Result<()> {
         return Ok(());
     }
 
-    reqwest::blocking::Client::new()
+    http_client()
         .post(daemon_url("/shutdown"))
         .timeout(Duration::from_secs(5))
         .send()
@@ -679,7 +780,7 @@ pub fn handle_stop() -> Result<()> {
 }
 
 pub fn handle_status() -> Result<()> {
-    match reqwest::blocking::Client::new()
+    match http_client()
         .get(daemon_url("/health"))
         .timeout(Duration::from_millis(1000))
         .send()
@@ -691,11 +792,16 @@ pub fn handle_status() -> Result<()> {
                 health.pid,
                 daemon_port()
             );
-            println!("  Uptime:  {}s", health.uptime_secs);
+            println!("  Uptime:    {}s", health.uptime_secs);
             if health.loaded_backends.is_empty() {
-                println!("  Models:  (none loaded yet)");
+                println!("  Loaded:    (none loaded yet)");
             } else {
-                println!("  Models:  {}", health.loaded_backends.join(", "));
+                println!("  Loaded:    {}", health.loaded_backends.join(", "));
+            }
+            if health.available_backends.is_empty() {
+                println!("  Available: (none detected)");
+            } else {
+                println!("  Available: {}", health.available_backends.join(", "));
             }
         }
         _ => {
