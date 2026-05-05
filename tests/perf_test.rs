@@ -1,5 +1,6 @@
 //! Performance tests — DB operations, bulk operations, response times.
 
+use vox::backend::TtsBackend;
 use vox::db;
 
 // ---------------------------------------------------------------------------
@@ -407,4 +408,95 @@ fn remove_clone_performance_with_many_entries() {
 
     let clones = db::list_clones(&conn).unwrap();
     assert!(clones.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Audio: volume scaling throughput (no device needed, empty samples shortcut)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audio_play_samples_empty_is_instant() {
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        vox::audio::play_samples_blocking(vec![], 24000, 1.0).unwrap();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 50,
+        "1000 empty play_samples_blocking took {}ms, expected <50ms",
+        elapsed.as_millis()
+    );
+}
+
+#[test]
+fn audio_play_samples_volume_scaling_throughput() {
+    let samples: Vec<f32> = (0..240).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        vox::audio::play_samples_blocking(samples.clone(), 24000, 0.75).unwrap();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 30000,
+        "100 volume-scaled play_samples calls took {}ms, expected <30000ms",
+        elapsed.as_millis()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VoXtream binary discovery caching (OnceLock)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn voxtream_find_cached_is_fast() {
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let _ = vox::backend::voxtream::VoxtreamBackend.is_available();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 10000,
+        "100 voxtream availability checks took {}ms, expected <10000ms",
+        elapsed.as_millis()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Daemon reachability check (is_running) under repeated calls
+// ---------------------------------------------------------------------------
+
+#[test]
+fn daemon_is_running_check_is_fast() {
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        let _ = vox::daemon::is_running();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 1000,
+        "1000 daemon::is_running checks took {}ms, expected <1000ms",
+        elapsed.as_millis()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backend resolution overhead (get_backend for each type)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backend_resolution_is_fast() {
+    let backends = ["say", "kokoro", "piper", "qwen-native", "voxtream"];
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        for name in &backends {
+            let _ = vox::backend::get_backend(name);
+        }
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 2000,
+        "5000 backend resolutions took {}ms, expected <2000ms",
+        elapsed.as_millis()
+    );
 }
