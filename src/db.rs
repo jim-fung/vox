@@ -144,13 +144,11 @@ pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
                 .parse::<u32>()
                 .context("Rate must be a positive integer")?;
         }
-        "lang" => {
-            if !config::SUPPORTED_LANGS.contains(&value) {
-                anyhow::bail!(
-                    "Unsupported language: {value}. Supported: {}",
-                    config::SUPPORTED_LANGS.join(", ")
-                );
-            }
+        "lang" if !config::SUPPORTED_LANGS.contains(&value) => {
+            anyhow::bail!(
+                "Unsupported language: {value}. Supported: {}",
+                config::SUPPORTED_LANGS.join(", ")
+            );
         }
         "backend" => {
             #[cfg(target_os = "macos")]
