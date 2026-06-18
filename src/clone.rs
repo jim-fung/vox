@@ -10,6 +10,7 @@ use crate::config;
 use crate::db;
 
 const VALID_AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg", "m4a"];
+const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
 
 pub fn sox_install_hint() -> &'static str {
     #[cfg(target_os = "macos")]
@@ -45,6 +46,13 @@ pub fn validate_audio(path: &str) -> Result<()> {
             "Unsupported audio format: .{ext}. Supported: {}",
             VALID_AUDIO_EXTENSIONS.join(", ")
         );
+    }
+    let metadata = p.metadata().context("Failed to read audio metadata")?;
+    if !metadata.is_file() {
+        bail!("Audio path is not a file: {path}");
+    }
+    if metadata.len() > MAX_AUDIO_BYTES {
+        bail!("Audio file is too large: maximum is 100MB");
     }
     Ok(())
 }

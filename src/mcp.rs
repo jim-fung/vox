@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, SpeakOptions};
 use crate::clone;
+use crate::daemon;
 use crate::db;
 use crate::pack;
 #[cfg(target_os = "macos")]
@@ -508,15 +509,9 @@ fn tool_speak(args: &Value) -> ToolResult {
     {
         ref_audio = Some(vc.ref_audio);
         ref_text = vc.ref_text;
-        if effective_backend != "qwen" && effective_backend != "qwen-native" {
-            #[cfg(target_os = "macos")]
-            {
-                effective_backend = "qwen".to_string();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                effective_backend = "qwen-native".to_string();
-            }
+        // Auto-switch to a clone-capable backend if the requested one isn't.
+        if !backend::is_clone_capable(&effective_backend) {
+            effective_backend = backend::default_clone_backend().to_string();
         }
         voice = None;
     }
@@ -539,7 +534,13 @@ fn tool_speak(args: &Value) -> ToolResult {
     };
 
     let start = std::time::Instant::now();
-    if let Err(e) = bk.speak(text, &opts) {
+    let is_heavy = backend::is_daemon_heavy(&effective_backend);
+    let speak_result = if is_heavy && daemon::is_running() {
+        daemon::speak_via_daemon(text, &effective_backend, &opts)
+    } else {
+        bk.speak(text, &opts)
+    };
+    if let Err(e) = speak_result {
         return tool_err(format!("speak error: {e}"));
     }
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -553,13 +554,17 @@ fn tool_speak(args: &Value) -> ToolResult {
         Some(duration_ms),
     );
 
+    // Truncate preview by character count (not bytes) to avoid splitting
+    // multi-byte UTF-8 sequences — French is the default language.
+    let preview: String = if text.chars().count() > 80 {
+        let mut s: String = text.chars().take(77).collect();
+        s.push_str("...");
+        s
+    } else {
+        text.to_string()
+    };
     tool_ok(format!(
-        "Spoken: \"{}\" ({duration_ms}ms, {effective_backend})",
-        if text.len() > 80 {
-            format!("{}...", &text[..77])
-        } else {
-            text.to_string()
-        }
+        "Spoken: \"{preview}\" ({duration_ms}ms, {effective_backend})"
     ))
 }
 

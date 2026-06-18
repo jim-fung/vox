@@ -123,9 +123,10 @@ fn backend_validation_rejects_unknown() {
 #[test]
 fn backend_validation_accepts_valid() {
     let conn = db::open_in_memory().unwrap();
-    // piper and qwen-native are always compiled in.
+    // piper, qwen-native, and voxtream are always compiled on all platforms
     assert!(db::set_preference(&conn, "backend", "piper").is_ok());
     assert!(db::set_preference(&conn, "backend", "qwen-native").is_ok());
+    assert!(db::set_preference(&conn, "backend", "voxtream").is_ok());
 }
 
 // ---------------------------------------------------------------------------

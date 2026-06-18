@@ -196,45 +196,14 @@ impl TtsBackend for PiperBackend {
             return Ok(());
         }
 
-        // Write to temp WAV
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&wav_path, spec)?;
-        for sample in &audio_data {
-            let s = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            writer.write_sample(s)?;
-        }
-        writer.finalize()?;
-
-        // Play audio
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("afplay")
-                .arg(&wav_path)
-                .status()
-                .context("failed to play audio")?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            crate::audio::apply_wav_gain(&wav_path, opts.volume)?;
-            crate::audio::play_wav_blocking(&wav_path)?;
-        }
-
-        let _ = std::fs::remove_file(&wav_path);
+        crate::audio::play_samples_blocking(audio_data, sample_rate, opts.volume)?;
         Ok(())
     }
 
     fn list_voices(&self) -> Result<Vec<String>> {
         Ok(vec![
             "en_US-lessac-medium".into(),
-            "fr_FR-siwis-medium".into(),
+            "fr_FR-tom-medium".into(),
             "es_ES-davefx-medium".into(),
             "de_DE-thorsten-medium".into(),
             "it_IT-riccardo-x_low".into(),

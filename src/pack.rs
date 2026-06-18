@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Component;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -48,6 +49,20 @@ pub struct SoundEntry {
 /// List packs available for install from the remote repository.
 pub fn list_available() -> &'static [&'static str] {
     AVAILABLE_PACKS
+}
+
+fn validate_sound_file(file: &str) -> Result<()> {
+    let path = std::path::Path::new(file);
+    if path.is_absolute() || file.is_empty() {
+        anyhow::bail!("Invalid sound file path in manifest: {file}");
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        anyhow::bail!("Invalid sound file path in manifest: {file}");
+    }
+    Ok(())
 }
 
 /// List installed packs by reading manifest.json from each pack directory.
@@ -110,6 +125,7 @@ pub fn install(name: &str) -> Result<()> {
     let mut files: HashSet<String> = HashSet::new();
     for cat in manifest.categories.values() {
         for sound in &cat.sounds {
+            validate_sound_file(&sound.file)?;
             files.insert(sound.file.clone());
         }
     }
@@ -186,6 +202,7 @@ pub fn play(name: &str, category: Option<&str>) -> Result<String> {
         % cat.sounds.len();
 
     let sound = &cat.sounds[idx];
+    validate_sound_file(&sound.file)?;
     let sound_path = config::packs_dir()
         .join(name)
         .join("sounds")
@@ -217,6 +234,7 @@ pub fn pick_sound(name: &str, category: Option<&str>) -> Result<(PathBuf, String
         % cat.sounds.len();
 
     let sound = &cat.sounds[idx];
+    validate_sound_file(&sound.file)?;
     let sound_path = config::packs_dir()
         .join(name)
         .join("sounds")

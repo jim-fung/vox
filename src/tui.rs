@@ -100,7 +100,14 @@ impl App {
             .and_then(|v| voices.iter().position(|x| x == v))
             .unwrap_or(0);
 
-        let volume_idx = VOLUME_PRESETS.iter().position(|x| *x == "1.0").unwrap_or(2);
+        let volume_idx = prefs
+            .volume
+            .and_then(|v| {
+                VOLUME_PRESETS
+                    .iter()
+                    .position(|p| p.parse::<f32>().is_ok_and(|pv| (pv - v).abs() < 0.001))
+            })
+            .unwrap_or_else(|| VOLUME_PRESETS.iter().position(|x| *x == "1.0").unwrap_or(2));
 
         Ok(Self {
             screen: Screen::Backend,
@@ -264,6 +271,7 @@ impl App {
         if let Some(s) = self.selected_style() {
             db::set_preference(&conn, "style", s)?;
         }
+        db::set_preference(&conn, "volume", VOLUME_PRESETS[self.volume_idx])?;
         self.status = "Preferences saved.".into();
         Ok(())
     }

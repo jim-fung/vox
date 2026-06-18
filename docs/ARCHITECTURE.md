@@ -2,17 +2,17 @@
 
 ## Vue d'ensemble
 
-vox est un CLI TTS cross-platform ecrit en Rust. Il transforme du texte en parole via quatre backends interchangeables et expose ses fonctionnalites comme serveur MCP (Model Context Protocol) pour l'integration avec les assistants IA.
+vox est un CLI TTS cross-platform ecrit en Rust. Il transforme du texte en parole via six backends interchangeables et expose ses fonctionnalites comme serveur MCP (Model Context Protocol) pour l'integration avec les assistants IA.
 
 ```
-                          vox (Rust)
-                              |
-            +---------+-------+-------+---------+
-            |         |               |         |
-          say      qwen          qwen-native  kokoro
-       (macOS)  (MLX/Python)    (pure Rust)  (pure Rust)
-       native   Apple Silicon   CPU/Metal    CPU/GPU
-                                /CUDA
+                                    vox (Rust)
+                                        |
+     +--------+--------+--------+-------+-------+---------+
+     |        |        |        |               |         |
+   say     piper   qwen-native voxtream       qwen      kokoro
+ (macOS)  (Rust/   (pure Rust) (zero-shot   (MLX/Py)  (Rust/ONNX)
+  native  ONNX)    CPU/Metal   voice clone)  Apple Si   CPU/GPU
+                    /CUDA                              [opt-in feature]
                     |
                   rodio (audio playback cross-platform)
 ```
@@ -25,11 +25,13 @@ src/
   lib.rs          Exports publics des modules
   mcp.rs          Serveur MCP JSON-RPC stdio (14 tools)
   backend/
-    mod.rs        Trait TtsBackend + dispatch get_backend()
-    say.rs        Backend macOS natif (NSSSpeechSynthesizer via /usr/bin/say)
+    mod.rs        Trait TtsBackend + dispatch get_backend() + registre des backends
+    say.rs        Backend macOS natif (NSSpeechSynthesizer via /usr/bin/say)
+    piper.rs      Backend Piper (Rust/ONNX, 30+ langues, cross-platform)
     qwen.rs       Backend MLX-Audio Python (Apple Silicon, macOS only)
     qwen_native.rs Backend candle/Rust (Qwen3-TTS, cross-platform)
-    kokoro.rs     Backend Kokoro-TTS (pure Rust, cross-platform)
+    voxtream.rs   Backend zero-shot voice cloning (subprocess Python)
+    kokoro.rs     Backend Kokoro-TTS (pure Rust/ONNX, cross-platform, feature opt-in)
   config.rs       Chemins config, constantes, enums (Gender, IntonationStyle)
   db.rs           SQLite (rusqlite) — preferences, clones, usage logs, stats
   init.rs         Auto-configuration pour 14 outils IA
@@ -46,8 +48,10 @@ src/
 | Backend | Plateforme | Dependance | Latence | Voice cloning |
 |---------|-----------|------------|---------|---------------|
 | `say` | macOS uniquement | Aucune (systeme) | ~100ms | Non |
+| `piper` | Toutes | Aucune (Rust/ONNX) | <1s | Non |
 | `qwen` | macOS (Apple Silicon) | `mlx-audio` (Python) | ~5-15s (cold) / ~1s (warm) | Oui |
 | `qwen-native` | Toutes | Aucune (Rust pur) | ~3-10s | Oui |
+| `voxtream` | Toutes | Binaire `voxtream` (Python) | ~170ms | Oui (zero-shot) |
 | `kokoro` | Toutes | Aucune (Rust pur) | ~2-5s | Non |
 
 ### Trait TtsBackend
@@ -66,7 +70,7 @@ Chaque backend implemente ce trait. Le dispatch se fait via `get_backend(name)` 
 ### Defaut par plateforme
 
 - **macOS**: `say` (zero latence, voix systeme)
-- **Linux / Windows**: `kokoro` (Rust pur, pas de dependance Python)
+- **Linux / Windows**: `piper` (Rust/ONNX, pas de dependance Python)
 
 ## SpeakOptions
 

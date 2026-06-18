@@ -71,29 +71,6 @@ pub fn parse_claude_response(body: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Empty response from Claude"))
 }
 
-/// Blocking Claude API call (kept for compatibility).
-pub fn call_claude(api_key: &str, model: &str, messages: &[Message]) -> Result<String> {
-    let request = build_claude_request(model, messages);
-
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(API_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", API_VERSION)
-        .header("content-type", "application/json")
-        .json(&request)
-        .send()
-        .context("Failed to call Claude API")?;
-
-    let status = resp.status();
-    let body = resp.text().context("Failed to read Claude API response")?;
-    if !status.is_success() {
-        anyhow::bail!("Claude API error ({status}): {body}");
-    }
-
-    parse_claude_response(&body)
-}
-
 /// Stream Claude API response via SSE, sending text deltas through the channel.
 pub fn stream_claude(
     api_key: &str,

@@ -101,6 +101,21 @@ fn test_set_preference_accepts_piper() {
 }
 
 #[test]
+fn test_set_and_get_volume_preference() {
+    let conn = db::open_in_memory().unwrap();
+    db::set_preference(&conn, "volume", "1.5").unwrap();
+    let prefs = db::get_preferences(&conn).unwrap();
+    assert_eq!(prefs.volume, Some(1.5));
+}
+
+#[test]
+fn test_set_preference_invalid_volume() {
+    let conn = db::open_in_memory().unwrap();
+    assert!(db::set_preference(&conn, "volume", "abc").is_err());
+    assert!(db::set_preference(&conn, "volume", "10.0").is_err());
+}
+
+#[test]
 fn test_reset_preferences() {
     let conn = db::open_in_memory().unwrap();
     db::set_preference(&conn, "lang", "fr").unwrap();

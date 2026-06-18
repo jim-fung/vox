@@ -51,6 +51,13 @@ pub trait TtsBackend {
     fn is_available(&self) -> bool;
 }
 
+// ── Backend-name registry (single source of truth) ──────────────────────
+//
+// Every place that needs to know "which backends exist / are clone-capable /
+// are daemon-heavy" should read from these, rather than maintaining its own
+// hard-coded list (which is how the CLI/MCP clone-switch divergence and the
+// db preference-validation gaps crept in).
+
 /// Names of backends compiled into the current build. Single source of truth
 /// for backend validation (used by db preference setter, TUI, etc.).
 pub fn supported_backends() -> Vec<&'static str> {
@@ -64,6 +71,41 @@ pub fn supported_backends() -> Vec<&'static str> {
         v.push("qwen");
     }
     v
+}
+
+/// Validate that a backend name is known and compiled for this build.
+pub fn is_valid_backend(name: &str) -> bool {
+    supported_backends().contains(&name)
+}
+
+/// Backends that support voice cloning via reference audio.
+/// When a clone name is resolved, the effective backend auto-switches to one
+/// of these if the requested backend isn't already clone-capable.
+pub const CLONE_CAPABLE: &[&str] = &["qwen", "qwen-native", "voxtream"];
+
+/// Backends whose models benefit from staying warm in a long-lived daemon.
+pub const DAEMON_HEAVY: &[&str] = &["voxtream", "qwen", "qwen-native", "kokoro"];
+
+/// Default clone-capable backend for the current platform.
+pub fn default_clone_backend() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "qwen"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "qwen-native"
+    }
+}
+
+/// Returns whether a backend name supports voice cloning.
+pub fn is_clone_capable(name: &str) -> bool {
+    CLONE_CAPABLE.contains(&name)
+}
+
+/// Returns whether a backend benefits from daemon routing (warm model).
+pub fn is_daemon_heavy(name: &str) -> bool {
+    DAEMON_HEAVY.contains(&name)
 }
 
 pub fn get_backend(name: &str) -> Result<Box<dyn TtsBackend>> {

@@ -100,23 +100,11 @@ impl TtsBackend for QwenNativeBackend {
             }
         })?;
 
-        // Apply volume gain to audio buffer
-        if (opts.volume - 1.0).abs() > f32::EPSILON {
-            for sample in &mut audio_buf.samples {
-                *sample = (*sample * opts.volume).clamp(-1.0, 1.0);
-            }
-        }
-
-        // Save to temp file and play with rodio
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-        audio_buf
-            .save(&wav_path)
-            .context("failed to save generated audio")?;
-
-        audio::play_wav_blocking(&wav_path)?;
-
-        let _ = std::fs::remove_file(&wav_path);
+        audio::play_samples_blocking(
+            std::mem::take(&mut audio_buf.samples),
+            audio_buf.sample_rate as u32,
+            opts.volume,
+        )?;
 
         Ok(())
     }

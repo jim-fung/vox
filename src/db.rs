@@ -18,6 +18,7 @@ pub struct Preferences {
     pub style: Option<String>,
     pub model: Option<String>,
     pub pack: Option<String>,
+    pub volume: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +66,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             rate    INTEGER,
             gender  TEXT,
             style   TEXT,
-            model   TEXT
+            model   TEXT,
+            volume  REAL
         );
 
         CREATE TABLE IF NOT EXISTS usage_log (
@@ -92,6 +94,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE preferences ADD COLUMN pack TEXT;")?;
     }
 
+    // Add volume column if it doesn't exist (migration for existing DBs)
+    let has_volume = conn.prepare("SELECT volume FROM preferences LIMIT 0").is_ok();
+    if !has_volume {
+        conn.execute_batch("ALTER TABLE preferences ADD COLUMN volume REAL;")?;
+    }
+
     Ok(())
 }
 
@@ -99,7 +107,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 pub fn get_preferences(conn: &Connection) -> Result<Preferences> {
     let mut stmt = conn.prepare(
-        "SELECT backend, voice, lang, rate, gender, style, model, pack FROM preferences WHERE id = 1",
+        "SELECT backend, voice, lang, rate, gender, style, model, pack, volume FROM preferences WHERE id = 1",
     )?;
     let result = stmt.query_row([], |row| {
         Ok(Preferences {
@@ -111,6 +119,7 @@ pub fn get_preferences(conn: &Connection) -> Result<Preferences> {
             style: row.get(5)?,
             model: row.get(6)?,
             pack: row.get(7)?,
+            volume: row.get::<_, Option<f32>>(8)?,
         })
     });
     match result {
@@ -122,7 +131,7 @@ pub fn get_preferences(conn: &Connection) -> Result<Preferences> {
 
 pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
     let valid_keys = [
-        "backend", "voice", "lang", "rate", "gender", "style", "model", "pack",
+        "backend", "voice", "lang", "rate", "gender", "style", "model", "pack", "volume",
     ];
     if !valid_keys.contains(&key) {
         anyhow::bail!(
@@ -144,13 +153,15 @@ pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
                 .parse::<u32>()
                 .context("Rate must be a positive integer")?;
         }
-        "lang" => {
-            if !config::SUPPORTED_LANGS.contains(&value) {
-                anyhow::bail!(
-                    "Unsupported language: {value}. Supported: {}",
-                    config::SUPPORTED_LANGS.join(", ")
-                );
-            }
+        "volume" => {
+            let v: f32 = value.parse().context("Volume must be a number")?;
+            anyhow::ensure!((0.0..=5.0).contains(&v), "Volume must be between 0.0 and 5.0");
+        }
+        "lang" if !config::SUPPORTED_LANGS.contains(&value) => {
+            anyhow::bail!(
+                "Unsupported language: {value}. Supported: {}",
+                config::SUPPORTED_LANGS.join(", ")
+            );
         }
         "backend" => {
             let valid_backends = crate::backend::supported_backends();

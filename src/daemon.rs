@@ -28,6 +28,7 @@ use crate::config;
 const DEFAULT_PORT: u16 = 19876;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const VOXTREAM_SERVER_PORT: u16 = 7860;
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub fn daemon_port() -> u16 {
     std::env::var("VOX_DAEMON_PORT")
@@ -68,8 +69,15 @@ pub fn remove_pid() {
 
 // ── Health check (client side) ───────────────────────────────
 
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 pub fn is_running() -> bool {
-    reqwest::blocking::Client::new()
+    http_client()
         .get(daemon_url("/health"))
         .timeout(Duration::from_millis(500))
         .send()
@@ -119,6 +127,7 @@ struct HealthResponse {
     status: String,
     uptime_secs: u64,
     loaded_backends: Vec<String>,
+    available_backends: Vec<String>,
     pid: u32,
 }
 
@@ -198,7 +207,10 @@ import json, sys, numpy as np, soundfile as sf
 from websockets.sync.client import connect
 ws = connect("ws://127.0.0.1:{port}/voxtream", close_timeout=5)
 try:
-    ws.send(json.dumps({{"event": "init", "prompt_audio_path": "{prompt}", "text": "{text}"}}))
+    prompt_audio_path = sys.argv[1]
+    text = sys.argv[2]
+    output_path = sys.argv[3]
+    ws.send(json.dumps({{"event": "init", "prompt_audio_path": prompt_audio_path, "text": text}}))
     sr = 24000
     frames = []
     while True:
@@ -215,7 +227,7 @@ try:
             elif data.get("type") in ("eos", "done", "error"):
                 break
     if frames:
-        sf.write("{output}", np.concatenate(frames), sr)
+        sf.write(output_path, np.concatenate(frames), sr)
 finally:
     try:
         ws.close()
@@ -223,9 +235,6 @@ finally:
         pass
 "#,
             port = VOXTREAM_SERVER_PORT,
-            prompt = prompt_audio.replace('"', r#"\""#),
-            text = text.replace('"', r#"\""#).replace('\n', " "),
-            output = output_wav.replace('"', r#"\""#),
         );
 
         let python = find_voxtream()
@@ -239,6 +248,9 @@ finally:
         let output = Command::new(&python)
             .arg("-c")
             .arg(&script)
+            .arg(prompt_audio)
+            .arg(text)
+            .arg(output_wav)
             .output()
             .context("failed to run voxtream WebSocket client")?;
 
@@ -297,6 +309,18 @@ impl DaemonState {
             backends.push("voxtream".into());
         }
         backends
+    }
+
+    async fn available_backends(&self) -> Vec<String> {
+        let mut available = Vec::new();
+        for name in &["say", "kokoro", "piper", "qwen-native", "voxtream"] {
+            if let Ok(b) = backend::get_backend(name)
+                && b.is_available()
+            {
+                available.push((*name).to_string());
+            }
+        }
+        available
     }
 
     /// Ensure voxtream-server is running, start if needed.
@@ -387,6 +411,18 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<DaemonState
         let lower = line.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
+            if content_length > MAX_REQUEST_BODY_BYTES {
+                let response_body =
+                    serde_json::json!({"error": "request body too large"}).to_string();
+                let http = format!(
+                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                writer.write_all(http.as_bytes()).await?;
+                writer.flush().await?;
+                return Ok(());
+            }
         }
     }
 
@@ -420,6 +456,7 @@ async fn route(
                 "status": "ok",
                 "uptime_secs": state.uptime_secs(),
                 "loaded_backends": state.loaded_backends().await,
+                "available_backends": state.available_backends().await,
                 "pid": std::process::id(),
             });
             ("200 OK", resp.to_string())
@@ -536,6 +573,87 @@ async fn route(
                 }
             }
         }
+        ("POST", "/preload") => {
+            let req: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let resp = serde_json::json!({"success": false, "error": format!("invalid JSON: {e}")});
+                    return ("400 Bad Request", resp.to_string());
+                }
+            };
+            let backend_name = req.get("backend").and_then(|v| v.as_str()).unwrap_or("all");
+            state.touch();
+
+            let backends_to_load: Vec<&str> = if backend_name == "all" {
+                vec!["kokoro", "qwen-native", "piper"]
+            } else {
+                vec![backend_name]
+            };
+
+            let mut loaded = Vec::new();
+            let mut errors = Vec::new();
+
+            for name in &backends_to_load {
+                let result = match *name {
+                    "kokoro" => {
+                        tokio::task::spawn_blocking(move || {
+                            let b = backend::get_backend("kokoro")?;
+                            let empty_opts = SpeakOptions {
+                                voice: None,
+                                lang: None,
+                                rate: None,
+                                gender: None,
+                                style: None,
+                                ref_audio: None,
+                                ref_text: None,
+                                model: None,
+                                volume: 1.0,
+                            };
+                            b.speak("", &empty_opts).map_err(|e| anyhow::anyhow!("{e}"))
+                        })
+                        .await
+                    }
+                    "qwen-native" => {
+                        tokio::task::spawn_blocking(|| {
+                            crate::backend::qwen_native::preload_model(None)
+                        })
+                        .await
+                    }
+                    "piper" => {
+                        tokio::task::spawn_blocking(|| {
+                            let _ = backend::get_backend("piper")?;
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await
+                    }
+                    _ => {
+                        errors.push(format!("unknown backend: {name}"));
+                        continue;
+                    }
+                };
+
+                match result {
+                    Ok(Ok(_)) => {
+                        eprintln!("[daemon] Preloaded {name}");
+                        loaded.push((*name).to_string());
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[daemon] Failed to preload {name}: {e:#}");
+                        errors.push(format!("{name}: {e:#}"));
+                    }
+                    Err(e) => {
+                        errors.push(format!("{name}: task panicked: {e}"));
+                    }
+                }
+            }
+
+            let resp = serde_json::json!({
+                "success": errors.is_empty(),
+                "loaded": loaded,
+                "errors": errors,
+            });
+            ("200 OK", resp.to_string())
+        }
         ("POST", "/shutdown") => {
             eprintln!("[daemon] Shutdown requested.");
             tokio::spawn(async {
@@ -570,10 +688,9 @@ pub fn speak_via_daemon(text: &str, backend: &str, opts: &SpeakOptions) -> Resul
         volume: opts.volume,
     };
 
-    let resp: SpeakResponse = reqwest::blocking::Client::new()
+    let resp: SpeakResponse = http_client()
         .post(daemon_url("/speak"))
         .json(&req)
-        .timeout(Duration::from_secs(120))
         .send()
         .context("failed to connect to vox daemon")?
         .json()
@@ -635,7 +752,7 @@ pub fn handle_stop() -> Result<()> {
         return Ok(());
     }
 
-    reqwest::blocking::Client::new()
+    http_client()
         .post(daemon_url("/shutdown"))
         .timeout(Duration::from_secs(5))
         .send()
@@ -663,7 +780,7 @@ pub fn handle_stop() -> Result<()> {
 }
 
 pub fn handle_status() -> Result<()> {
-    match reqwest::blocking::Client::new()
+    match http_client()
         .get(daemon_url("/health"))
         .timeout(Duration::from_millis(1000))
         .send()
@@ -675,11 +792,16 @@ pub fn handle_status() -> Result<()> {
                 health.pid,
                 daemon_port()
             );
-            println!("  Uptime:  {}s", health.uptime_secs);
+            println!("  Uptime:    {}s", health.uptime_secs);
             if health.loaded_backends.is_empty() {
-                println!("  Models:  (none loaded yet)");
+                println!("  Loaded:    (none loaded yet)");
             } else {
-                println!("  Models:  {}", health.loaded_backends.join(", "));
+                println!("  Loaded:    {}", health.loaded_backends.join(", "));
+            }
+            if health.available_backends.is_empty() {
+                println!("  Available: (none detected)");
+            } else {
+                println!("  Available: {}", health.available_backends.join(", "));
             }
         }
         _ => {

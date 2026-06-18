@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
@@ -36,10 +37,11 @@ pub fn default_prompt_audio() -> Result<PathBuf> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if let Ok(s) = status {
-            if s.success() && path.exists() {
-                return Ok(path);
-            }
+        if let Ok(s) = status
+            && s.success()
+            && path.exists()
+        {
+            return Ok(path);
         }
     }
 
@@ -52,18 +54,23 @@ pub fn default_prompt_audio() -> Result<PathBuf> {
 
 pub struct VoxtreamBackend;
 
+static VOXTREAM_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// Find the voxtream binary — check PATH first, then common venv locations.
 pub fn find_voxtream() -> Option<PathBuf> {
+    VOXTREAM_BIN.get_or_init(find_voxtream_uncached).clone()
+}
+
+fn find_voxtream_uncached() -> Option<PathBuf> {
     // Check PATH
     if let Ok(status) = Command::new("voxtream")
         .arg("--help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
+        && status.success()
     {
-        if status.success() {
-            return Some(PathBuf::from("voxtream"));
-        }
+        return Some(PathBuf::from("voxtream"));
     }
 
     // Check common venv locations

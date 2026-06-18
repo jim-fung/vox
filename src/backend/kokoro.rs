@@ -198,14 +198,7 @@ impl TtsBackend for KokoroBackend {
                 .map_err(|e| anyhow::anyhow!("Kokoro synthesis failed: {e}"))
         })?;
 
-        // Write samples to WAV and play
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-        write_wav(&wav_path, &samples, SAMPLE_RATE)?;
-
-        crate::audio::apply_wav_gain(&wav_path, opts.volume)?;
-        crate::audio::play_wav_blocking(&wav_path)?;
-        let _ = std::fs::remove_file(&wav_path);
+        crate::audio::play_samples_blocking(samples, SAMPLE_RATE, opts.volume)?;
         Ok(())
     }
 
@@ -276,20 +269,4 @@ impl TtsBackend for KokoroBackend {
     fn is_available(&self) -> bool {
         model_path().exists() && voices_path().exists()
     }
-}
-
-/// Write f32 PCM samples to a WAV file.
-fn write_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).context("failed to create WAV file")?;
-    for &s in samples {
-        writer.write_sample(s).context("failed to write sample")?;
-    }
-    writer.finalize().context("failed to finalize WAV file")?;
-    Ok(())
 }
