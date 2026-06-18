@@ -50,8 +50,8 @@ struct Cli {
     model: Option<String>,
 
     /// Volume multiplier (1.0 = normal, 0.5 = half, 2.0 = double, range: 0.0–5.0)
-    #[arg(long, default_value = "1.0", value_parser = parse_volume)]
-    volume: f32,
+    #[arg(long, value_parser = parse_volume)]
+    volume: Option<f32>,
 
     /// List available voices for the selected backend
     #[arg(long)]
@@ -257,18 +257,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// The backend to use for voice cloning (auto-detected by platform).
-fn voice_clone_backend() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "qwen"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "qwen-native"
-    }
-}
-
 fn handle_speak(cli: Cli) -> Result<()> {
     let conn = db::open()?;
     let prefs = db::get_preferences(&conn)?;
@@ -286,6 +274,7 @@ fn handle_speak(cli: Cli) -> Result<()> {
     let gender = cli.gender.or(prefs.gender);
     let style = cli.style.or(prefs.style);
     let model = cli.model.or(prefs.model);
+    let volume = cli.volume.or(prefs.volume).unwrap_or(1.0);
 
     // Resolve voice clone
     let mut ref_audio = None;
@@ -298,8 +287,8 @@ fn handle_speak(cli: Cli) -> Result<()> {
         ref_audio = Some(vc.ref_audio);
         ref_text = vc.ref_text;
         // Auto-switch to a clone-capable backend (unless already on one)
-        if !["qwen", "qwen-native", "voxtream"].contains(&effective_backend.as_str()) {
-            effective_backend = voice_clone_backend().to_string();
+        if !backend::is_clone_capable(&effective_backend) {
+            effective_backend = backend::default_clone_backend().to_string();
         }
         voice = None; // don't pass clone name as --voice
     }
@@ -325,16 +314,13 @@ fn handle_speak(cli: Cli) -> Result<()> {
         ref_audio,
         ref_text,
         model,
-        volume: cli.volume,
+        volume,
     };
 
     let start = Instant::now();
 
     // Try daemon for heavy backends (warm model = fast inference)
-    let is_heavy = matches!(
-        effective_backend.as_str(),
-        "voxtream" | "qwen" | "qwen-native" | "kokoro"
-    );
+    let is_heavy = backend::is_daemon_heavy(&effective_backend);
     if is_heavy && daemon::is_running() {
         daemon::speak_via_daemon(&text, &effective_backend, &opts)?;
     } else {
@@ -527,6 +513,29 @@ fn handle_hear(lang: String, timeout: u32, silence: f64) -> Result<()> {
     Ok(())
 }
 
+/// Compute the MCP settings path for a VS Code extension (Cline, Roo Code, Kilo Code, ...).
+///
+/// All three VS Code extensions share the same
+/// `globalStorage/<ext>/settings/cline_mcp_settings.json` layout, differing only by
+/// extension ID. This avoids triplicating the platform-specific base-path logic.
+fn vscode_ext_mcp_path(home: &std::path::Path, extension_id: &str) -> std::path::PathBuf {
+    let rel = format!("Code/User/globalStorage/{extension_id}/settings/cline_mcp_settings.json");
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support").join(&rel)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::config_dir()
+            .map(|d| d.join(&rel))
+            .unwrap_or_else(|| home.join("AppData/Roaming").join(&rel))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home.join(".config").join(&rel)
+    }
+}
+
 fn handle_init(mode: InitMode) -> Result<()> {
     let do_cli = matches!(mode, InitMode::Cli | InitMode::All);
     let do_mcp = matches!(mode, InitMode::Mcp | InitMode::All);
@@ -641,46 +650,11 @@ fn handle_init(mode: InitMode) -> Result<()> {
             init::inject_mcp_server(&path, "vox", &mcp_entry),
         );
 
-        // -- Cline (VS Code extension) --
-        #[cfg(target_os = "macos")]
-        let path = home_path.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json");
-        #[cfg(target_os = "windows")]
-        let path = dirs::config_dir()
-            .map(|d| d.join("Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"))
-            .unwrap_or_else(|| home_path.join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"));
-        #[cfg(target_os = "linux")]
-        let path = home_path.join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json");
-        configure("Cline", init::inject_mcp_server(&path, "vox", &mcp_entry));
-
-        // -- Roo Code (VS Code extension) --
-        #[cfg(target_os = "macos")]
-        let path = home_path.join("Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json");
-        #[cfg(target_os = "windows")]
-        let path = dirs::config_dir()
-            .map(|d| d.join("Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"))
-            .unwrap_or_else(|| home_path.join("AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"));
-        #[cfg(target_os = "linux")]
-        let path = home_path.join(".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json");
-        configure(
-            "Roo Code",
-            init::inject_mcp_server(&path, "vox", &mcp_entry),
-        );
-
-        // -- Kilo Code (VS Code extension) --
-        #[cfg(target_os = "macos")]
-        let path = home_path.join("Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/cline_mcp_settings.json");
-        #[cfg(target_os = "windows")]
-        let path = dirs::config_dir()
-            .map(|d| d.join("Code/User/globalStorage/kilocode.kilo-code/settings/cline_mcp_settings.json"))
-            .unwrap_or_else(|| home_path.join("AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings/cline_mcp_settings.json"));
-        #[cfg(target_os = "linux")]
-        let path = home_path.join(
-            ".config/Code/User/globalStorage/kilocode.kilo-code/settings/cline_mcp_settings.json",
-        );
-        configure(
-            "Kilo Code",
-            init::inject_mcp_server(&path, "vox", &mcp_entry),
-        );
+        // -- VS Code extensions (Cline, Roo Code, Kilo Code) --
+        // All three share the same globalStorage layout; only the extension ID differs.
+        configure("Cline", init::inject_mcp_server(&vscode_ext_mcp_path(&home_path, "saoudrizwan.claude-dev"), "vox", &mcp_entry));
+        configure("Roo Code", init::inject_mcp_server(&vscode_ext_mcp_path(&home_path, "rooveterinaryinc.roo-cline"), "vox", &mcp_entry));
+        configure("Kilo Code", init::inject_mcp_server(&vscode_ext_mcp_path(&home_path, "kilocode.kilo-code"), "vox", &mcp_entry));
 
         // -- Amp --
         let path = home_path.join(".ampcode/settings.json");

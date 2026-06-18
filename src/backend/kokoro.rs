@@ -270,19 +270,3 @@ impl TtsBackend for KokoroBackend {
         model_path().exists() && voices_path().exists()
     }
 }
-
-/// Write f32 PCM samples to a WAV file.
-fn write_wav(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).context("failed to create WAV file")?;
-    for &s in samples {
-        writer.write_sample(s).context("failed to write sample")?;
-    }
-    writer.finalize().context("failed to finalize WAV file")?;
-    Ok(())
-}

@@ -1,7 +1,8 @@
 //! vox — Cross-platform TTS CLI with MCP server for AI assistants.
 //!
-//! Four backends: `say` (macOS native), `qwen` (MLX Python), `qwen-native` (pure Rust),
-//! `kokoro` (pure Rust). Exposes 14 MCP tools over stdio for integration with
+//! Six backends: `say` (macOS native), `piper` (pure Rust/ONNX), `qwen-native` (pure Rust),
+//! `voxtream` (zero-shot voice cloning), `qwen` (MLX Python), `kokoro` (pure Rust/ONNX).
+//! Exposes 14 MCP tools over stdio for integration with
 //! Claude Code, Cursor, VS Code, and 11 other AI tools.
 
 pub mod audio;

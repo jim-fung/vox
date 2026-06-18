@@ -159,7 +159,7 @@ impl TtsBackend for PiperBackend {
     fn list_voices(&self) -> Result<Vec<String>> {
         Ok(vec![
             "en_US-lessac-medium".into(),
-            "fr_FR-siwis-medium".into(),
+            "fr_FR-tom-medium".into(),
             "es_ES-davefx-medium".into(),
             "de_DE-thorsten-medium".into(),
             "it_IT-riccardo-x_low".into(),

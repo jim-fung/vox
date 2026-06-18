@@ -15,7 +15,7 @@ echo "Texte pipe" | vox             # Lecture depuis stdin
 
 | Flag | Description | Exemple |
 |------|-------------|---------|
-| `-b` | Backend TTS | `-b kokoro`, `-b say`, `-b qwen-native` |
+| `-b` | Backend TTS | `-b piper`, `-b say`, `-b qwen-native`, `-b voxtream`, `-b kokoro` |
 | `-v` | Voix ou clone | `-v Chelsie`, `-v patrick` |
 | `-l` | Langue | `-l fr`, `-l ja`, `-l en` |
 | `-r` | Debit (mots/min, backend say) | `-r 200` |
@@ -77,7 +77,7 @@ Priorite de resolution : **flags CLI / params MCP > preferences DB > valeurs par
 
 | Cle | Valeurs acceptees | Validation |
 |-----|-------------------|-----------|
-| `backend` | macOS: `kokoro`, `say`, `qwen`, `qwen-native` / Autres: `kokoro`, `qwen-native` | Whitelist par plateforme |
+| `backend` | macOS: `say`, `piper`, `qwen`, `qwen-native`, `voxtream`, `kokoro` / Autres: `piper`, `qwen-native`, `voxtream`, `kokoro` | Whitelist par plateforme |
 | `voice` | Nom de voix ou de clone (texte libre) | Aucune (le backend valide au moment du speak) |
 | `lang` | `en`, `fr`, `es`, `de`, `it`, `pt`, `zh`, `ja`, `ko`, `ru`, `ar`, `nl` | Validation contre `SUPPORTED_LANGS` |
 | `rate` | Entier positif (mots/min, ex: `150`, `200`) | Parse en `u32`, erreur si non-numerique |
@@ -99,7 +99,7 @@ Priorite de resolution : **flags CLI / params MCP > preferences DB > valeurs par
 | Langues | Toutes (via voix) | en, fr, ja, zh, ko, hi, it, pt, de, es | en, fr, es, de, it, pt, zh, ja, ko, ru, ar, nl | en, fr, es, de, it, pt, zh, ja, ko, ru |
 | Plateforme | macOS | Toutes | macOS (Apple Silicon) | Toutes |
 | GPU | Non | Non | Non (CPU MLX) | Metal (macOS) / CUDA (Linux) |
-| Dependance externe | Aucune | `kokoro-onnx`, `soundfile` (Python) | `mlx-audio` (Python) | Aucune (Rust pur) |
+| Dependance externe | Aucune | Aucune (Rust/ONNX pur) | `mlx-audio` (Python) | Aucune (Rust pur) |
 
 ## Sound packs
 
@@ -195,8 +195,8 @@ Le serveur est normalement lance automatiquement par l'outil IA. Il n'est pas ne
 
 | Outil | Description | Parametres |
 |-------|-------------|------------|
-| `vox_speak` | Synthetise et joue du texte | **`text`** (requis, string) : texte a prononcer. `voice` (string) : nom de voix ou clone. `lang` (string) : code langue. `backend` (string) : kokoro/say/qwen/qwen-native. `style` (string) : calm/energetic/warm/authoritative/cheerful/serious. `gender` (string) : feminine/masculine. `rate` (integer) : debit mots/min (say uniquement). |
-| `vox_list_voices` | Liste les voix d'un backend | `backend` (string) : kokoro/say/qwen/qwen-native. Defaut : backend par defaut de la plateforme. |
+| `vox_speak` | Synthetise et joue du texte | **`text`** (requis, string) : texte a prononcer. `voice` (string) : nom de voix ou clone. `lang` (string) : code langue. `backend` (string) : say/piper/qwen/qwen-native/voxtream/kokoro. `style` (string) : calm/energetic/warm/authoritative/cheerful/serious. `gender` (string) : feminine/masculine. `rate` (integer) : debit mots/min (say uniquement). |
+| `vox_list_voices` | Liste les voix d'un backend | `backend` (string) : say/piper/qwen/qwen-native/voxtream/kokoro. Defaut : backend par defaut de la plateforme. |
 | `vox_clone_list` | Liste les voice clones | Aucun parametre. |
 | `vox_clone_add` | Ajoute un voice clone | **`name`** (requis, string) : nom du clone. **`audio`** (requis, string) : chemin du fichier audio de reference. `text` (string) : transcription de l'audio (ameliore la qualite). |
 | `vox_clone_remove` | Supprime un voice clone | **`name`** (requis, string) : nom du clone a supprimer. |

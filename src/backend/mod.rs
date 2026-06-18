@@ -51,6 +51,58 @@ pub trait TtsBackend {
     fn is_available(&self) -> bool;
 }
 
+// ── Backend-name registry (single source of truth) ──────────────────────
+//
+// Every place that needs to know "which backends exist / are clone-capable /
+// are daemon-heavy" should read from these, rather than maintaining its own
+// hard-coded list (which is how the CLI/MCP clone-switch divergence and the
+// db preference-validation gaps crept in).
+
+/// Backends that support voice cloning via reference audio.
+/// When a clone name is resolved, the effective backend auto-switches to one
+/// of these if the requested backend isn't already clone-capable.
+pub const CLONE_CAPABLE: &[&str] = &["qwen", "qwen-native", "voxtream"];
+
+/// Backends whose models benefit from staying warm in a long-lived daemon.
+pub const DAEMON_HEAVY: &[&str] = &["voxtream", "qwen", "qwen-native", "kokoro"];
+
+/// Default clone-capable backend for the current platform.
+pub fn default_clone_backend() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "qwen"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "qwen-native"
+    }
+}
+
+/// Returns whether a backend name supports voice cloning.
+pub fn is_clone_capable(name: &str) -> bool {
+    CLONE_CAPABLE.contains(&name)
+}
+
+/// Returns whether a backend benefits from daemon routing (warm model).
+pub fn is_daemon_heavy(name: &str) -> bool {
+    DAEMON_HEAVY.contains(&name)
+}
+
+/// All backend names compiled into this build (cfg-aware).
+pub fn compiled_backend_names() -> Vec<&'static str> {
+    let mut names: Vec<&str> = vec!["piper", "qwen-native", "voxtream"];
+    #[cfg(feature = "kokoro")]
+    names.push("kokoro");
+    #[cfg(target_os = "macos")]
+    names.extend(["say", "qwen"]);
+    names
+}
+
+/// Validate that a backend name is known and compiled for this build.
+pub fn is_valid_backend(name: &str) -> bool {
+    compiled_backend_names().contains(&name)
+}
+
 pub fn get_backend(name: &str) -> Result<Box<dyn TtsBackend>> {
     match name {
         #[cfg(feature = "kokoro")]
