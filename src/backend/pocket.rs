@@ -154,7 +154,7 @@ impl TtsBackend for PocketBackend {
         "pocket"
     }
 
-    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+    fn synthesize(&self, text: &str, opts: &SpeakOptions) -> Result<super::AudioBuffer> {
         // Reference audio (voice cloning) takes precedence over a named voice.
         let voice = opts
             .ref_audio
@@ -163,24 +163,28 @@ impl TtsBackend for PocketBackend {
             .unwrap_or(DEFAULT_VOICE)
             .to_string();
 
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-
         with_model(|model| {
             let voice_state = resolve_voice_state(model, &voice)?;
             let audio_tensor = model
                 .generate(text, &voice_state)
                 .context("pocket-tts generation failed")?;
-            pocket_tts::audio::write_wav(&wav_path, &audio_tensor, model.sample_rate as u32)
-                .context("failed to save generated audio")
-        })?;
+            let sample_rate = model.sample_rate as u32;
+            // audio_tensor is a candle Tensor of shape [channels, samples]. Take
+            // channel 0 (vox uses mono throughout).
+            let channels: Vec<Vec<f32>> = audio_tensor
+                .to_vec2::<f32>()
+                .context("failed to read generated audio tensor")?;
+            let samples = channels.into_iter().next().unwrap_or_default();
+            Ok(super::AudioBuffer {
+                samples,
+                sample_rate,
+            })
+        })
+    }
 
-        audio::apply_wav_gain(&wav_path, opts.volume)?;
-        audio::play_wav_blocking(&wav_path)?;
-
-        let _ = std::fs::remove_file(&wav_path);
-
-        Ok(())
+    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+        let buffer = self.synthesize(text, opts)?;
+        audio::play(&buffer, opts.volume)
     }
 
     fn list_voices(&self) -> Result<Vec<String>> {

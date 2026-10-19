@@ -12,10 +12,70 @@ use crate::backend::{self, SpeakOptions};
 use crate::db;
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
-pub const SYSTEM_PROMPT: &str = "Tu es un assistant vocal. Réponds de manière concise et naturelle, comme dans une conversation orale.";
+pub const SYSTEM_PROMPT: &str =
+    "You are a voice assistant. Answer concisely and naturally, like a spoken conversation.";
 pub const MAX_TOKENS: u32 = 1024;
 pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const API_VERSION: &str = "2023-06-01";
+
+pub fn system_prompt(lang: Option<&str>) -> &'static str {
+    match lang {
+        Some("fr") => {
+            "Tu es un assistant vocal. Réponds de manière concise et naturelle, comme dans une conversation orale."
+        }
+        Some("es") => {
+            "Eres un asistente de voz. Responde de forma concisa y natural, como en una conversación oral."
+        }
+        Some("de") => {
+            "Du bist ein Sprachassistent. Antworte kurz und natürlich, wie in einem gesprochenen Gespräch."
+        }
+        Some("it") => {
+            "Sei un assistente vocale. Rispondi in modo conciso e naturale, come in una conversazione parlata."
+        }
+        _ => SYSTEM_PROMPT,
+    }
+}
+
+pub fn chat_strings(
+    lang: Option<&str>,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match lang {
+        Some("fr") => (
+            "Bonjour, je t'écoute.",
+            "Appuie sur Entrée quand tu as fini de parler",
+            "(rien détecté, réessaie)",
+            "Réflexion...",
+            "Au revoir !",
+        ),
+        Some("es") => (
+            "Hola, te escucho.",
+            "Pulsa Enter cuando termines de hablar",
+            "(no se detectó nada, inténtalo de nuevo)",
+            "Pensando...",
+            "¡Adiós!",
+        ),
+        Some("de") => (
+            "Hallo, ich höre zu.",
+            "Drücke Enter, wenn du fertig gesprochen hast",
+            "(nichts erkannt, bitte erneut versuchen)",
+            "Denke nach...",
+            "Auf Wiedersehen!",
+        ),
+        _ => (
+            "Hello, I'm listening.",
+            "Press Enter when you finish speaking",
+            "(nothing detected, try again)",
+            "Thinking...",
+            "Goodbye!",
+        ),
+    }
+}
 
 const EXIT_WORDS: &[&str] = &[
     "quit",
@@ -30,6 +90,7 @@ const EXIT_WORDS: &[&str] = &[
 
 pub struct ChatConfig {
     pub voice_clone: Option<db::VoiceClone>,
+    pub voice: Option<String>,
     pub lang: Option<String>,
     pub api_key: String,
     pub model: String,
@@ -45,6 +106,7 @@ impl Default for ChatConfig {
     fn default() -> Self {
         Self {
             voice_clone: None,
+            voice: None,
             lang: None,
             api_key: String::new(),
             model: DEFAULT_MODEL.to_string(),
@@ -90,6 +152,7 @@ pub fn speak_text(text: &str, config: &ChatConfig) -> Result<()> {
         (
             "qwen",
             SpeakOptions {
+                voice: config.voice.clone(),
                 lang: config.lang.clone(),
                 ..Default::default()
             },

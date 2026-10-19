@@ -1,5 +1,7 @@
-/// Default minimum chunk size (matches backend/qwen.rs for subprocess TTS).
-const DEFAULT_MIN_CHUNK_CHARS: usize = 120;
+/// Default minimum chunk size (characters) before a sentence boundary triggers an
+/// emit. Shared by the subprocess qwen backend (backend/qwen.rs) and the in-process
+/// streaming chat. Single source of truth — see R6.
+pub const MIN_CHUNK_CHARS: usize = 120;
 
 /// Lower threshold for streaming chat — smaller chunks = lower latency.
 pub const STREAMING_MIN_CHUNK_CHARS: usize = 60;
@@ -23,7 +25,7 @@ impl SentenceAccumulator {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
-            min_chars: DEFAULT_MIN_CHUNK_CHARS,
+            min_chars: MIN_CHUNK_CHARS,
         }
     }
 

@@ -6,7 +6,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +14,13 @@ use crate::audio;
 use crate::config;
 
 const PACKS_REPO: &str = "https://raw.githubusercontent.com/tonyyont/peon-ping/main/packs";
+
+/// Pick a uniformly-random index in `0..len`. Replaces the old `subsec_nanos %
+/// len` pattern which was biased and predictable (review PK1).
+fn pick_random_index(len: usize) -> usize {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0..len)
+}
 
 const AVAILABLE_PACKS: &[&str] = &[
     "peon",
@@ -178,12 +184,7 @@ pub fn play(name: &str, category: Option<&str>) -> Result<String> {
         anyhow::bail!("No sounds in category '{cat_name}'");
     }
 
-    // Pseudo-random selection using system time nanoseconds
-    let idx = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as usize
-        % cat.sounds.len();
+    let idx = pick_random_index(cat.sounds.len());
 
     let sound = &cat.sounds[idx];
     let sound_path = config::packs_dir()
@@ -210,11 +211,7 @@ pub fn pick_sound(name: &str, category: Option<&str>) -> Result<(PathBuf, String
         anyhow::bail!("No sounds in category '{cat_name}'");
     }
 
-    let idx = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as usize
-        % cat.sounds.len();
+    let idx = pick_random_index(cat.sounds.len());
 
     let sound = &cat.sounds[idx];
     let sound_path = config::packs_dir()

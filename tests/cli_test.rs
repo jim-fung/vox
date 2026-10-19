@@ -67,7 +67,7 @@ fn test_list_voices_qwen_native() {
         .args(["--backend", "qwen-native", "--list-voices"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("voice clones"));
+        .stdout(predicate::str::contains("Ryan"));
 }
 
 #[test]

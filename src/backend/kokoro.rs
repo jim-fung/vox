@@ -156,7 +156,7 @@ impl TtsBackend for KokoroBackend {
         "kokoro"
     }
 
-    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+    fn synthesize(&self, text: &str, opts: &SpeakOptions) -> Result<super::AudioBuffer> {
         let mp = model_path();
         let vp = voices_path();
         if !mp.exists() || !vp.exists() {
@@ -198,15 +198,15 @@ impl TtsBackend for KokoroBackend {
                 .map_err(|e| anyhow::anyhow!("Kokoro synthesis failed: {e}"))
         })?;
 
-        // Write samples to WAV and play
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-        write_wav(&wav_path, &samples, SAMPLE_RATE)?;
+        Ok(super::AudioBuffer {
+            samples,
+            sample_rate: SAMPLE_RATE,
+        })
+    }
 
-        crate::audio::apply_wav_gain(&wav_path, opts.volume)?;
-        crate::audio::play_wav_blocking(&wav_path)?;
-        let _ = std::fs::remove_file(&wav_path);
-        Ok(())
+    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+        let buffer = self.synthesize(text, opts)?;
+        crate::audio::play(&buffer, opts.volume)
     }
 
     fn list_voices(&self) -> Result<Vec<String>> {

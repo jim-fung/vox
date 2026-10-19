@@ -18,6 +18,17 @@ pub const SUPPORTED_LANGS: &[&str] = &[
     "en", "fr", "es", "de", "it", "pt", "zh", "ja", "ko", "ru", "ar", "nl",
 ];
 
+/// Normalize a locale such as `fr-FR` or `en_US` to a supported language code.
+pub fn normalize_locale(locale: &str) -> Option<String> {
+    let lang = locale.split(['-', '_']).next()?.to_lowercase();
+    SUPPORTED_LANGS.contains(&lang.as_str()).then_some(lang)
+}
+
+/// Return the configured system language when vox supports it.
+pub fn system_lang() -> Option<String> {
+    normalize_locale(&sys_locale::get_locale()?)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gender {
     Feminine,

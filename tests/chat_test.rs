@@ -77,3 +77,39 @@ fn parse_claude_response_multiblock() {
     // Should return first block
     assert_eq!(text, "Premier");
 }
+
+#[test]
+fn system_prompt_english_and_french() {
+    assert_eq!(
+        chat::system_prompt(None),
+        "You are a voice assistant. Answer concisely and naturally, like a spoken conversation."
+    );
+    assert_eq!(
+        chat::system_prompt(Some("fr")),
+        "Tu es un assistant vocal. Réponds de manière concise et naturelle, comme dans une conversation orale."
+    );
+}
+
+#[test]
+fn chat_strings_are_localized_for_english_and_french() {
+    assert_eq!(
+        chat::chat_strings(None),
+        (
+            "Hello, I'm listening.",
+            "Press Enter when you finish speaking",
+            "(nothing detected, try again)",
+            "Thinking...",
+            "Goodbye!",
+        )
+    );
+    assert_eq!(
+        chat::chat_strings(Some("fr")),
+        (
+            "Bonjour, je t'écoute.",
+            "Appuie sur Entrée quand tu as fini de parler",
+            "(rien détecté, réessaie)",
+            "Réflexion...",
+            "Au revoir !",
+        )
+    );
+}

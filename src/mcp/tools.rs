@@ -1,213 +1,22 @@
-//! MCP (Model Context Protocol) server — JSON-RPC 2.0 over stdio.
+//! MCP tool definitions and implementations — the 14 vox_* tools.
 //!
-//! Exposes 14 tools for AI assistants: speak, hear, voice cloning, config, stats, packs.
-//! Launched via `vox serve` and auto-configured by `vox init` for 14 AI tools.
+//! Split out of the protocol framing (see `protocol.rs`) for navigability — R4.
+//! `tool_definitions()` and `call_tool()` are consumed by the protocol layer.
 
-use std::io::{self, BufRead, Write};
-
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::backend::{self, SpeakOptions};
+use crate::backend;
 use crate::clone;
 use crate::db;
 use crate::pack;
 #[cfg(target_os = "macos")]
 use crate::stt;
-
-const SERVER_NAME: &str = "vox";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: &str = "2024-11-05";
-
-const VOX_INSTRUCTIONS_TEMPLATE: &str = "\
-You have access to vox, a text-to-speech tool. Use it to give spoken feedback to the user.\n\
-\n\
-WHEN TO SPEAK (vox_speak):\n\
-- After completing a significant task (feature, bug fix, refactor): summarize what was done\n\
-- When the user asks you to explain something verbally\n\
-- For important warnings or status updates the user should hear\n\
-\n\
-WHEN NOT TO SPEAK:\n\
-- Trivial operations (formatting, single-line fixes, file reads)\n\
-- When the user is clearly reading the output already\n\
-- Rapid back-and-forth conversation\n\
-\n\
-GUIDELINES:\n\
-- Keep summaries under 2 sentences\n\
-{language_guideline}\n\
-- Use vox_config_show to check the user's preferred voice/backend before first use\n\
-- For longer explanations, use vox_speak with a concise summary, not the full text\n\
-\n\
-VOICE CONVERSATION (vox_hear + vox_speak):\n\
-You can have a voice conversation with the user — you ARE the brain, no API key needed.\n\
-Loop: vox_hear (listen) → you think → vox_speak (respond). Repeat until the user says goodbye.\n\
-When the user asks to \"chat\" or \"talk\" or \"parler\", start this loop.";
-
-fn configured_lang() -> Option<String> {
-    db::open()
-        .ok()
-        .and_then(|conn| db::get_preferences(&conn).ok())
-        .and_then(|prefs| prefs.lang)
-        .filter(|lang| !lang.is_empty())
-}
-
-fn normalize_locale(locale: &str) -> Option<String> {
-    let lang = locale.split(['-', '_']).next()?.to_lowercase();
-    crate::config::SUPPORTED_LANGS
-        .contains(&lang.as_str())
-        .then_some(lang)
-}
-
-fn system_lang() -> Option<String> {
-    normalize_locale(&sys_locale::get_locale()?)
-}
-
-fn default_lang() -> Option<String> {
-    configured_lang().or_else(system_lang)
-}
-
-fn vox_instructions(lang: Option<&str>) -> String {
-    let language_guideline = match lang {
-        Some(lang) => format!(
-            "- Speak in the user's language ({lang}); honour any language they explicitly ask for"
-        ),
-        None => "- Match the language the user is writing in".to_string(),
-    };
-    VOX_INSTRUCTIONS_TEMPLATE.replace("{language_guideline}", &language_guideline)
-}
-
-#[derive(Deserialize)]
-struct JsonRpcMessage {
-    id: Option<Value>,
-    method: Option<String>,
-    params: Option<Value>,
-}
-
-#[derive(Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<Value>,
-}
-
-impl JsonRpcResponse {
-    fn ok(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    fn err(id: Value, code: i64, message: String) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(json!({"code": code, "message": message})),
-        }
-    }
-}
-
-/// Run the vox MCP server on stdio.
-pub fn run_server() -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let msg: JsonRpcMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(e) => {
-                let resp = JsonRpcResponse::err(Value::Null, -32700, format!("parse error: {e}"));
-                write_response(&mut stdout, &resp)?;
-                continue;
-            }
-        };
-
-        let method = msg.method.as_deref().unwrap_or("");
-
-        // Notifications have no id
-        let id = match msg.id {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let response = match method {
-            "initialize" => handle_initialize(id),
-            "ping" => JsonRpcResponse::ok(id, json!({})),
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, &msg.params),
-            _ => JsonRpcResponse::err(id, -32601, format!("method not found: {method}")),
-        };
-
-        write_response(&mut stdout, &response)?;
-    }
-
-    Ok(())
-}
-
-fn write_response(stdout: &mut io::Stdout, resp: &JsonRpcResponse) -> Result<()> {
-    let json = serde_json::to_string(resp)?;
-    writeln!(stdout, "{json}")?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn handle_initialize(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::ok(
-        id,
-        json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "version": SERVER_VERSION
-            },
-            "instructions": vox_instructions(default_lang().as_deref())
-        }),
-    )
-}
-
-fn handle_tools_list(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::ok(id, json!({ "tools": tool_definitions() }))
-}
-
-fn handle_tools_call(id: Value, params: &Option<Value>) -> JsonRpcResponse {
-    let params = match params {
-        Some(p) => p,
-        None => return JsonRpcResponse::err(id, -32602, "missing params".into()),
-    };
-
-    let tool_name = match params.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n,
-        None => return JsonRpcResponse::err(id, -32602, "missing tool name".into()),
-    };
-
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    let result = call_tool(tool_name, &args);
-
-    JsonRpcResponse::ok(id, json!(result))
-}
-
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
 
-fn tool_definitions() -> Value {
+pub(super) fn tool_definitions() -> Value {
     json!([
         {
             "name": "vox_speak",
@@ -426,7 +235,7 @@ fn tool_definitions() -> Value {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct ToolResult {
+pub(super) struct ToolResult {
     content: Vec<ToolContent>,
     #[serde(rename = "isError", skip_serializing_if = "std::ops::Not::not")]
     is_error: bool,
@@ -459,7 +268,7 @@ fn tool_err(text: String) -> ToolResult {
     }
 }
 
-fn call_tool(name: &str, args: &Value) -> ToolResult {
+pub(super) fn call_tool(name: &str, args: &Value) -> ToolResult {
     match name {
         "vox_speak" => tool_speak(args),
         "vox_list_voices" => tool_list_voices(args),
@@ -489,111 +298,49 @@ fn tool_speak(args: &Value) -> ToolResult {
         Ok(c) => c,
         Err(e) => return tool_err(format!("database error: {e}")),
     };
-    let prefs = db::get_preferences(&conn).unwrap_or_default();
 
-    let lang = args
-        .get("lang")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or(prefs.lang);
-
-    // Merge MCP args > DB preferences > language-aware defaults
-    let backend_name = args
-        .get("backend")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or(prefs.backend)
-        .unwrap_or_else(|| crate::config::default_backend_for_lang(lang.as_deref()).to_string());
-
-    let mut voice = args
-        .get("voice")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or(prefs.voice);
-    let rate = args
-        .get("rate")
-        .and_then(|v| v.as_u64())
-        .map(|r| r as u32)
-        .or(prefs.rate);
-    let gender = args
-        .get("gender")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or(prefs.gender);
-    let style = args
-        .get("style")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or(prefs.style);
-    let volume = args
-        .get("volume")
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .unwrap_or(1.0)
-        .clamp(0.0, 5.0);
-
-    // Resolve voice clone
-    let mut ref_audio = None;
-    let mut ref_text = None;
-    let mut effective_backend = backend_name;
-
-    if let Some(ref voice_name) = voice
-        && let Ok(Some(vc)) = clone::resolve_voice(&conn, voice_name)
-    {
-        ref_audio = Some(vc.ref_audio);
-        ref_text = vc.ref_text;
-        if effective_backend != "qwen" && effective_backend != "qwen-native" {
-            #[cfg(target_os = "macos")]
-            {
-                effective_backend = "qwen".to_string();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                effective_backend = "qwen-native".to_string();
-            }
-        }
-        voice = None;
-    }
-
-    let bk = match backend::get_backend(&effective_backend) {
-        Ok(b) => b,
-        Err(e) => return tool_err(format!("backend error: {e}")),
-    };
-
-    let opts = SpeakOptions {
-        voice,
-        lang: lang.clone(),
-        rate,
-        gender,
-        style,
-        ref_audio,
-        ref_text,
+    // Parse MCP JSON args into the shared SpeakInput, then delegate resolution +
+    // dispatch + logging to the shared core. This fixes A4: the MCP path now
+    // uses the same CLONE_CAPABLE_BACKENDS set as the CLI (pocket/voxtream
+    // clones are no longer dropped).
+    let input = crate::speak::SpeakInput {
+        text: text.to_string(),
+        backend_override: args
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        voice: args.get("voice").and_then(|v| v.as_str()).map(String::from),
+        lang: args.get("lang").and_then(|v| v.as_str()).map(String::from),
+        rate: args.get("rate").and_then(|v| v.as_u64()).map(|r| r as u32),
+        gender: args
+            .get("gender")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        style: args.get("style").and_then(|v| v.as_str()).map(String::from),
         model: None,
-        volume,
+        volume: args
+            .get("volume")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+    };
+    let route = crate::speak::SpeakRouteOpts { allow_daemon: true };
+
+    let outcome = match crate::speak::resolve_and_speak(&conn, input, route) {
+        Ok(o) => o,
+        Err(e) => return tool_err(format!("speak error: {e}")),
     };
 
-    let start = std::time::Instant::now();
-    if let Err(e) = bk.speak(text, &opts) {
-        return tool_err(format!("speak error: {e}"));
-    }
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let _ = db::log_usage(
-        &conn,
-        &effective_backend,
-        opts.voice.as_deref(),
-        opts.lang.as_deref(),
-        text.len(),
-        Some(duration_ms),
-    );
-
+    // Truncate on a char boundary — slicing bytes here panics on multi-byte
+    // UTF-8 (CJK, emoji), which an AI agent can send freely.
+    let preview: String = text.chars().take(77).collect();
+    let preview = if text.chars().count() > 80 {
+        format!("{preview}...")
+    } else {
+        preview
+    };
     tool_ok(format!(
-        "Spoken: \"{}\" ({duration_ms}ms, {effective_backend})",
-        if text.len() > 80 {
-            format!("{}...", &text[..77])
-        } else {
-            text.to_string()
-        }
+        "Spoken: \"{preview}\" ({}, {})",
+        outcome.duration_ms, outcome.backend
     ))
 }
 
@@ -1003,48 +750,5 @@ fn tool_hear(args: &Value) -> ToolResult {
         } else {
             tool_ok(text)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn instructions_default_to_user_language_when_unset() {
-        let instructions = vox_instructions(None);
-        assert!(instructions.contains("Match the language the user is writing in"));
-        assert!(!instructions.contains("Use French by default"));
-    }
-
-    #[test]
-    fn instructions_follow_configured_language() {
-        assert!(vox_instructions(Some("fr")).contains("Speak in the user's language (fr)"));
-        assert!(vox_instructions(Some("es")).contains("Speak in the user's language (es)"));
-        assert!(vox_instructions(Some("ja")).contains("Speak in the user's language (ja)"));
-    }
-
-    #[test]
-    fn normalize_locale_maps_primary_subtag_when_supported() {
-        assert_eq!(normalize_locale("fr-FR"), Some("fr".to_string()));
-        assert_eq!(normalize_locale("en_US"), Some("en".to_string()));
-        assert_eq!(normalize_locale("de-AT"), Some("de".to_string()));
-        assert_eq!(normalize_locale("FR"), Some("fr".to_string()));
-        assert_eq!(normalize_locale("zh-Hant"), Some("zh".to_string()));
-    }
-
-    #[test]
-    fn normalize_locale_rejects_unsupported_or_empty() {
-        assert_eq!(normalize_locale("cy-GB"), None);
-        assert_eq!(normalize_locale("C"), None);
-        assert_eq!(normalize_locale(""), None);
-    }
-
-    #[test]
-    fn system_lang_is_supported_or_none() {
-        assert!(
-            system_lang()
-                .is_none_or(|lang| crate::config::SUPPORTED_LANGS.contains(&lang.as_str()))
-        );
     }
 }

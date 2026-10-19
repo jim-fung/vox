@@ -60,10 +60,33 @@ pub fn resolve_voice(conn: &Connection, voice_name: &str) -> Result<Option<db::V
     db::get_clone(conn, voice_name)
 }
 
+/// Sanitize a clone name into a safe filename component. Strips path separators,
+/// `..`, and other shell/FS-significant characters so `record_clone` can't write
+/// outside the clones directory (review CL2). The DB stores the original name;
+/// only the on-disk WAV filename is sanitized.
+pub fn sanitize_clone_filename(name: &str) -> String {
+    // Replace any path separator or null with underscore, collapse leading dots.
+    let safe: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' | ':' | '\n' | '\r' => '_',
+            _ => c,
+        })
+        .collect();
+    // Strip leading dots so the file isn't hidden or ".."-traversable.
+    let safe = safe.trim_start_matches('.');
+    if safe.is_empty() {
+        "clone".to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
 pub fn record_clone(name: &str, duration: u32) -> Result<String> {
     let dir = config::clones_dir();
     std::fs::create_dir_all(&dir).context("Failed to create clones directory")?;
-    let output_path = dir.join(format!("{name}.wav"));
+    let filename = sanitize_clone_filename(name);
+    let output_path = dir.join(format!("{filename}.wav"));
     let output_str = output_path.to_string_lossy().to_string();
 
     eprintln!("Recording {duration}s of audio... Speak now!");

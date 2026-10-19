@@ -118,6 +118,31 @@ fn model_for_lang(lang: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Download a URL into memory, rejecting responses whose Content-Length exceeds
+/// `max_bytes`. Prevents a compromised/misconfigured server from OOMing vox
+/// (review PP2/NW4).
+fn download_with_size_cap(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let resp = client.get(url).send().context("download request failed")?;
+    if let Some(len) = resp.content_length()
+        && len as usize > max_bytes
+    {
+        anyhow::bail!(
+            "download too large: {len} bytes (cap {max_bytes}); refusing to download {url}"
+        );
+    }
+    let bytes = resp.bytes().context("failed to read download body")?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!(
+            "download exceeded cap: {} bytes (cap {max_bytes})",
+            bytes.len()
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Ensure model files exist, downloading if needed. Returns (onnx_path, json_path).
 fn ensure_model(lang: &str) -> Result<(PathBuf, PathBuf)> {
     let (model_name, base_url) = model_for_lang(lang);
@@ -130,8 +155,7 @@ fn ensure_model(lang: &str) -> Result<(PathBuf, PathBuf)> {
     if !onnx_path.exists() {
         eprintln!("Downloading piper model '{model_name}'...");
         let url = format!("{base_url}/{model_name}.onnx?download=true");
-        let bytes = reqwest::blocking::get(&url)
-            .and_then(|r| r.bytes())
+        let bytes = download_with_size_cap(&url, 200 * 1024 * 1024)
             .with_context(|| format!("failed to download {model_name}.onnx"))?;
         std::fs::write(&onnx_path, &bytes)?;
         eprintln!(
@@ -143,8 +167,7 @@ fn ensure_model(lang: &str) -> Result<(PathBuf, PathBuf)> {
 
     if !json_path.exists() {
         let url = format!("{base_url}/{model_name}.onnx.json?download=true");
-        let bytes = reqwest::blocking::get(&url)
-            .and_then(|r| r.bytes())
+        let bytes = download_with_size_cap(&url, 1024 * 1024)
             .with_context(|| format!("failed to download {model_name}.onnx.json"))?;
         std::fs::write(&json_path, &bytes)?;
     }
@@ -182,7 +205,7 @@ impl TtsBackend for PiperBackend {
         "piper"
     }
 
-    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+    fn synthesize(&self, text: &str, opts: &SpeakOptions) -> Result<super::AudioBuffer> {
         let lang = opts.lang.as_deref().unwrap_or("en");
 
         let mut guard = get_or_load_model(lang)?;
@@ -192,60 +215,32 @@ impl TtsBackend for PiperBackend {
             .create(text, false, None, None, None, None)
             .map_err(|e| anyhow::anyhow!("Piper TTS failed: {e}"))?;
 
-        if audio_data.is_empty() {
-            return Ok(());
-        }
-
-        // Write to temp WAV
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-
-        let spec = hound::WavSpec {
-            channels: 1,
+        Ok(super::AudioBuffer {
+            samples: audio_data,
             sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&wav_path, spec)?;
-        for sample in &audio_data {
-            let s = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            writer.write_sample(s)?;
-        }
-        writer.finalize()?;
+        })
+    }
 
-        // Play audio
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("afplay")
-                .arg(&wav_path)
-                .status()
-                .context("failed to play audio")?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            crate::audio::apply_wav_gain(&wav_path, opts.volume)?;
-            crate::audio::play_wav_blocking(&wav_path)?;
-        }
-
-        let _ = std::fs::remove_file(&wav_path);
-        Ok(())
+    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+        // Buffer synthesis + shared playback applies `opts.volume` uniformly on
+        // every platform. Previously macOS used `afplay` directly and ignored
+        // volume (review AU1).
+        let buffer = self.synthesize(text, opts)?;
+        crate::audio::play(&buffer, opts.volume)
     }
 
     fn list_voices(&self) -> Result<Vec<String>> {
-        Ok(vec![
-            "en_US-lessac-medium".into(),
-            "fr_FR-siwis-medium".into(),
-            "es_ES-davefx-medium".into(),
-            "de_DE-thorsten-medium".into(),
-            "it_IT-riccardo-x_low".into(),
-            "pt_BR-faber-medium".into(),
-            "zh_CN-huayan-medium".into(),
-            "ja_JP-kokoro-medium".into(),
-            "ko_KR-kss-medium".into(),
-            "ru_RU-irina-medium".into(),
-            "ar_JO-kareem-medium".into(),
-            "nl_NL-mls-medium".into(),
-        ])
+        // Generated from model_for_lang so the listed voices match what actually
+        // downloads — fixes the drift where list_voices advertised
+        // "fr_FR-siwis-medium" but model_for_lang downloaded "fr_FR-tom-medium"
+        // (review PP5/B5).
+        let langs = [
+            "en", "fr", "es", "de", "it", "pt", "zh", "ja", "ko", "ru", "ar", "nl",
+        ];
+        Ok(langs
+            .iter()
+            .map(|l| model_for_lang(l).0.to_string())
+            .collect())
     }
 
     fn is_available(&self) -> bool {

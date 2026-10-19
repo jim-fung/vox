@@ -10,21 +10,19 @@ use anyhow::{Context, Result};
 
 use super::{SpeakOptions, TtsBackend};
 use crate::audio;
+use crate::chat::sentence::MIN_CHUNK_CHARS;
 
 pub struct QwenBackend;
 
 const DEFAULT_MODEL: &str = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16";
 
-/// Minimum chunk size in characters before splitting on sentence boundary.
-/// Larger chunks = fewer subprocess calls = less overhead per model load.
-const MIN_CHUNK_CHARS: usize = 120;
-
 impl QwenBackend {
     pub fn build_generate_command(text: &str, opts: &SpeakOptions) -> Command {
+        let model = opts.model.as_deref().unwrap_or(DEFAULT_MODEL);
         let mut cmd = Command::new("python3");
         cmd.arg("-m").arg("mlx_audio.tts.generate");
         cmd.arg("--text").arg(text);
-        cmd.arg("--model").arg(DEFAULT_MODEL);
+        cmd.arg("--model").arg(model);
         cmd.arg("--play");
         cmd.arg("--stream");
         Self::apply_voice_opts(&mut cmd, opts);
@@ -38,10 +36,11 @@ impl QwenBackend {
         opts: &SpeakOptions,
         output_dir: &Path,
     ) -> Command {
+        let model = opts.model.as_deref().unwrap_or(DEFAULT_MODEL);
         let mut cmd = Command::new("python3");
         cmd.arg("-m").arg("mlx_audio.tts.generate");
         cmd.arg("--text").arg(text);
-        cmd.arg("--model").arg(DEFAULT_MODEL);
+        cmd.arg("--model").arg(model);
         Self::apply_voice_opts(&mut cmd, opts);
         cmd.current_dir(output_dir);
         cmd
@@ -126,21 +125,6 @@ fn find_wav_in_dir(dir: &Path) -> Result<PathBuf> {
         .context("no audio_*.wav file found in chunk directory")
 }
 
-/// Remove orphaned `audio_*.wav` files from the current working directory.
-fn cleanup_cwd_wav() {
-    if let Ok(dir) = std::env::current_dir()
-        && let Ok(entries) = std::fs::read_dir(&dir)
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("audio_") && name_str.ends_with(".wav") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
 impl TtsBackend for QwenBackend {
     fn name(&self) -> &str {
         "qwen"
@@ -150,9 +134,14 @@ impl TtsBackend for QwenBackend {
         let chunks = Self::split_sentences(text);
 
         if chunks.len() <= 1 {
-            // Single chunk: use --play --stream for best latency
+            // Single chunk: use --play --stream for best latency. Run in a tempdir
+            // so mlx_audio's stray audio_*.wav files don't pollute the user's CWD
+            // (review QW2) — previously cleanup_cwd_wav swept the real CWD.
+            let tempdir = tempfile::tempdir().context("failed to create temp directory")?;
             for chunk in &chunks {
-                let status = Self::build_generate_command(chunk, opts)
+                let mut cmd = Self::build_generate_command(chunk, opts);
+                cmd.current_dir(tempdir.path());
+                let status = cmd
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
@@ -163,7 +152,7 @@ impl TtsBackend for QwenBackend {
                     anyhow::bail!("mlx_audio generation failed with status {status}");
                 }
             }
-            cleanup_cwd_wav();
+            // tempdir dropped here → stray files cleaned up automatically.
             return Ok(());
         }
 

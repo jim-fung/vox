@@ -4,7 +4,10 @@
 //! Schema is auto-migrated on first open.
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+
+// Re-export so callers that take `&Connection` (e.g. speak::resolve_and_speak,
+// db tests) can name the type without depending on rusqlite directly.
+pub use rusqlite::Connection;
 
 use crate::config;
 

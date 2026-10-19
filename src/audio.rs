@@ -72,6 +72,50 @@ pub fn play_audio_blocking(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Apply volume gain and play an in-memory PCM buffer.
+///
+/// This is the single place gain is applied for buffer-producing backends
+/// (piper, pocket, qwen-native, kokoro, voxtream), which previously each
+/// handled `opts.volume` inconsistently (e.g. macOS piper ignored it entirely).
+/// Gain is applied in-memory, the buffer is written to a temporary WAV, played
+/// via rodio, and the temp file removed. A volume of 1.0 skips the per-sample
+/// multiply.
+pub fn play(buffer: &crate::backend::AudioBuffer, volume: f32) -> Result<()> {
+    if buffer.samples.is_empty() {
+        return Ok(());
+    }
+
+    // Apply gain in-memory, clamping to avoid clipping.
+    let samples: Vec<f32> = if (volume - 1.0).abs() <= f32::EPSILON {
+        buffer.samples.clone()
+    } else {
+        buffer
+            .samples
+            .iter()
+            .map(|s| (s * volume).clamp(-1.0, 1.0))
+            .collect()
+    };
+
+    let tmp = tempfile::NamedTempFile::new().context("failed to create temp WAV")?;
+    let wav_path = tmp.path().with_extension("wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: buffer.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer =
+        hound::WavWriter::create(&wav_path, spec).context("failed to create WAV for playback")?;
+    for &s in &samples {
+        writer.write_sample(s).context("failed to write sample")?;
+    }
+    writer.finalize().context("failed to finalize WAV")?;
+
+    play_wav_blocking(&wav_path)?;
+    let _ = std::fs::remove_file(&wav_path);
+    Ok(())
+}
+
 /// Handle for async WAV playback — keeps audio alive until `wait()` or drop.
 pub struct PlayHandle {
     join: Option<thread::JoinHandle<Result<()>>>,

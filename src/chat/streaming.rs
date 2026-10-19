@@ -1,13 +1,15 @@
 use std::io::{self, Write};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
-use super::claude_api::{StreamEvent, stream_claude};
+use super::claude_api::{ClaudeStreamer, StreamEvent};
 use super::sentence::{STREAMING_MIN_CHUNK_CHARS, SentenceAccumulator};
 use super::{ChatConfig, Message, is_exit, record_until_enter, speak_text};
 use crate::backend::qwen_native;
@@ -16,6 +18,32 @@ use crate::stt;
 enum TtsCommand {
     Speak(String),
     Done,
+    Cancel,
+}
+
+/// Listen for Ctrl-C once and notify the active response loop without terminating chat.
+fn install_cancellation_listener() -> Result<mpsc::Receiver<()>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create cancellation runtime")
+            .and_then(|rt| {
+                rt.block_on(async move {
+                    loop {
+                        tokio::signal::ctrl_c().await?;
+                        if tx.send(()).is_err() {
+                            return Ok(());
+                        }
+                    }
+                })
+            });
+        if let Err(error) = result {
+            eprintln!("Warning: unable to listen for cancellation: {error}");
+        }
+    });
+    Ok(rx)
 }
 
 /// Crossfade duration in milliseconds between consecutive TTS sentences.
@@ -58,7 +86,10 @@ enum TtsStrategy {
     /// macOS `say` command — instant, no model loading.
     Say { voice: Option<String> },
     /// qwen-native streaming — neural voice, needs model load.
-    QwenNative { lang: Option<String> },
+    QwenNative {
+        voice: Option<String>,
+        lang: Option<String>,
+    },
     /// qwen-native voice cloning — blocking per sentence.
     VoiceClone {
         voice_clone: crate::db::VoiceClone,
@@ -68,8 +99,10 @@ enum TtsStrategy {
 
 /// Run the streaming chat loop: STT -> Claude streaming -> TTS pipelining.
 pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
+    let cancel_rx = install_cancellation_listener()?;
     let mut messages: Vec<Message> = Vec::new();
-    let greeting = "Bonjour, je t'écoute.";
+    let (greeting, record_prompt, empty_input, thinking, farewell) =
+        super::chat_strings(config.lang.as_deref());
 
     // Determine TTS strategy: voice clone > say (macOS, fast) > qwen-native
     let strategy = if let Some(vc) = config.voice_clone.clone() {
@@ -78,14 +111,13 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
             lang: config.lang.clone(),
         }
     } else if cfg!(target_os = "macos") {
-        // Use say backend on macOS for instant TTS
-        let voice = crate::db::open()
-            .ok()
-            .and_then(|conn| crate::db::get_preferences(&conn).ok())
-            .and_then(|prefs| prefs.voice);
-        TtsStrategy::Say { voice }
+        // Use say backend on macOS for instant TTS.
+        TtsStrategy::Say {
+            voice: config.voice.clone(),
+        }
     } else {
         TtsStrategy::QwenNative {
+            voice: config.voice.clone(),
             lang: config.lang.clone(),
         }
     };
@@ -118,7 +150,7 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
     let audio_str = audio_path.to_string_lossy().to_string();
 
     loop {
-        eprintln!("\n[Appuie sur Enter quand tu as fini de parler]");
+        eprintln!("\n[{record_prompt}]");
         io::stderr().flush()?;
 
         record_until_enter(&audio_str)?;
@@ -129,12 +161,11 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
         eprintln!(" \"{user_text}\"");
 
         if user_text.is_empty() {
-            eprintln!("(rien détecté, réessaie)");
+            eprintln!("{empty_input}");
             continue;
         }
 
         if is_exit(&user_text) {
-            let farewell = "Au revoir !";
             eprintln!("{farewell}");
             speak_text(farewell, &config)?;
             break;
@@ -146,8 +177,11 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
         });
 
         // --- Streaming response ---
-        eprint!("Réflexion...");
+        eprint!("{thinking}");
         io::stderr().flush()?;
+
+        // Shared state used by the response loop, Claude request, and playback.
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         // Channel: main thread -> TTS thread (sentences to speak)
         let (tts_tx, tts_rx) = mpsc::channel::<TtsCommand>();
@@ -156,18 +190,26 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
         let tts_handle = match &strategy {
             TtsStrategy::Say { voice } => {
                 let voice = voice.clone();
-                thread::spawn(move || -> Result<()> { run_tts_say_loop(tts_rx, voice.as_deref()) })
-            }
-            TtsStrategy::QwenNative { lang } => {
-                let lang = lang.clone();
+                let cancelled = cancelled.clone();
                 thread::spawn(move || -> Result<()> {
-                    run_tts_streaming_loop(tts_rx, lang.as_deref())
+                    run_tts_say_loop(tts_rx, voice.as_deref(), cancelled)
+                })
+            }
+            TtsStrategy::QwenNative { voice, lang } => {
+                let voice = voice.clone();
+                let lang = lang.clone();
+                let cancelled = cancelled.clone();
+                thread::spawn(move || -> Result<()> {
+                    run_tts_streaming_loop(tts_rx, voice, lang, cancelled)
                 })
             }
             TtsStrategy::VoiceClone { voice_clone, lang } => {
                 let vc = voice_clone.clone();
                 let lang = lang.clone();
-                thread::spawn(move || -> Result<()> { run_tts_clone_loop(tts_rx, Some(vc), lang) })
+                let cancelled = cancelled.clone();
+                thread::spawn(move || -> Result<()> {
+                    run_tts_clone_loop(tts_rx, Some(vc), lang, cancelled)
+                })
             }
         };
 
@@ -177,9 +219,24 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
         // Spawn Claude streaming in a thread
         let api_key = config.api_key.clone();
         let model = config.model.clone();
+        let lang = config.lang.clone();
         let msgs = messages.clone();
+        let claude_cancelled = cancelled.clone();
         let claude_handle = thread::spawn(move || -> Result<()> {
-            stream_claude(&api_key, &model, &msgs, claude_tx)
+            let cancelled = claude_cancelled;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to create tokio runtime")?;
+            let streamer = ClaudeStreamer::new();
+            rt.block_on(streamer.stream(
+                &api_key,
+                &model,
+                &msgs,
+                lang.as_deref(),
+                claude_tx,
+                cancelled,
+            ))
         });
 
         // Accumulate sentences from Claude stream and send to TTS
@@ -188,9 +245,16 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
         let mut full_reply = String::new();
         let mut first_token = true;
 
-        for event in claude_rx {
-            match event {
-                StreamEvent::TextDelta(text) => {
+        let mut response_cancelled = false;
+        loop {
+            if cancel_rx.try_recv().is_ok() {
+                cancelled.store(true, Ordering::Release);
+                let _ = tts_tx.send(TtsCommand::Cancel);
+                response_cancelled = true;
+                break;
+            }
+            match claude_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(StreamEvent::TextDelta(text)) => {
                     if first_token {
                         eprintln!(" OK");
                         first_token = false;
@@ -198,18 +262,19 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
                     full_reply.push_str(&text);
                     eprint!("{text}");
                     io::stderr().flush()?;
-
                     for sentence in accumulator.push(&text) {
                         let _ = tts_tx.send(TtsCommand::Speak(sentence));
                     }
                 }
-                StreamEvent::Done => {
+                Ok(StreamEvent::Done) => {
                     if let Some(remaining) = accumulator.flush() {
                         let _ = tts_tx.send(TtsCommand::Speak(remaining));
                     }
                     let _ = tts_tx.send(TtsCommand::Done);
                     break;
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         eprintln!(); // newline after streamed text
@@ -219,8 +284,10 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
             .join()
             .map_err(|_| anyhow::anyhow!("Claude thread panicked"))?
         {
-            eprintln!("Claude API error: {e}");
-            let _ = tts_tx.send(TtsCommand::Done);
+            if !response_cancelled {
+                eprintln!("Claude API error: {e}");
+                let _ = tts_tx.send(TtsCommand::Done);
+            }
         }
 
         // Wait for TTS to finish playback
@@ -231,10 +298,14 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
             eprintln!("TTS error: {e}");
         }
 
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: full_reply,
-        });
+        if response_cancelled {
+            eprintln!("Response cancelled.");
+        } else {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: full_reply,
+            });
+        }
     }
 
     let _ = std::fs::remove_file(&audio_path);
@@ -242,21 +313,52 @@ pub fn run_chat_loop(config: ChatConfig) -> Result<()> {
 }
 
 /// TTS thread using macOS `say` command — instant, sentence by sentence.
-fn run_tts_say_loop(rx: mpsc::Receiver<TtsCommand>, voice: Option<&str>) -> Result<()> {
-    for cmd in rx {
+fn run_tts_say_loop(
+    rx: mpsc::Receiver<TtsCommand>,
+    voice: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let cmd = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         match cmd {
             TtsCommand::Speak(text) => {
-                let mut cmd = Command::new("/usr/bin/say");
+                let mut say = Command::new("/usr/bin/say");
                 if let Some(v) = voice {
-                    cmd.arg("-v").arg(v);
+                    say.arg("-v").arg(v);
                 }
-                cmd.arg(&text);
-                let _ = cmd.status();
+                let mut child = say.arg(&text).spawn().context("failed to start say")?;
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(());
+                    }
+                    if child.try_wait()?.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
             }
-            TtsCommand::Done => break,
+            TtsCommand::Done => return Ok(()),
+            TtsCommand::Cancel => return Ok(()),
         }
     }
-    Ok(())
+}
+
+fn wait_for_sink(sink: &Sink, cancelled: &AtomicBool) {
+    while !sink.empty() && !cancelled.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        sink.stop();
+    }
 }
 
 /// TTS thread using qwen-native: blocking synthesis per sentence with crossfade.
@@ -265,64 +367,93 @@ fn run_tts_say_loop(rx: mpsc::Receiver<TtsCommand>, voice: Option<&str>) -> Resu
 /// buffer. Each sentence plays smoothly (no intra-sentence gaps). While the sink
 /// plays sentence N, synthesis of sentence N+1 starts immediately, minimizing
 /// inter-sentence gaps. Cosine crossfade eliminates clicks at boundaries.
-fn run_tts_streaming_loop(rx: mpsc::Receiver<TtsCommand>, lang: Option<&str>) -> Result<()> {
-    use qwen3_tts::Speaker;
+fn run_tts_streaming_loop(
+    rx: mpsc::Receiver<TtsCommand>,
+    voice: Option<String>,
+    lang: Option<String>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    use crate::backend::{self, SpeakOptions};
 
     let (_stream, stream_handle) =
         OutputStream::try_default().context("Failed to open audio output device")?;
     let sink = Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
-
-    let tts_lang = qwen_native::parse_language(lang.unwrap_or("en"))?;
-
+    let backend = backend::get_backend("qwen-native")?;
     let mut prev_tail: Option<(Vec<f32>, u32)> = None;
     let mut is_first_sentence = true;
 
-    for cmd in rx {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            sink.stop();
+            return Ok(());
+        }
+        let cmd = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         match cmd {
             TtsCommand::Speak(text) => {
-                qwen_native::with_model(None, |model| {
-                    let audio =
-                        model.synthesize_with_voice(&text, Speaker::Ryan, tts_lang, None)?;
-                    let sr = audio.sample_rate;
-                    let mut samples = audio.samples;
-                    let overlap = ((sr as usize * CROSSFADE_MS) / 1000).min(samples.len());
-
-                    // Crossfade with previous sentence's tail.
-                    if let Some((tail, _)) = prev_tail.take() {
-                        crossfade_into(&tail, &mut samples, overlap);
-                    } else if is_first_sentence {
-                        fade_in(&mut samples, overlap);
-                        is_first_sentence = false;
-                    }
-
-                    // Hold back tail for crossfade with next sentence.
-                    if samples.len() > overlap {
-                        let split_at = samples.len() - overlap;
-                        let tail = samples.split_off(split_at);
-                        sink.append(SamplesBuffer::new(1, sr, samples));
-                        prev_tail = Some((tail, sr));
-                    } else {
-                        prev_tail = Some((samples, sr));
-                    }
-
-                    Ok(())
-                })?;
+                let opts = SpeakOptions {
+                    voice: voice.clone(),
+                    lang: lang.clone(),
+                    ..Default::default()
+                };
+                let audio = backend.synthesize(&text, &opts)?;
+                if cancelled.load(Ordering::Acquire) {
+                    sink.stop();
+                    return Ok(());
+                }
+                append_crossfaded_audio(
+                    &sink,
+                    &mut prev_tail,
+                    &mut is_first_sentence,
+                    audio.samples,
+                    audio.sample_rate,
+                );
             }
             TtsCommand::Done => {
-                // Flush remaining tail with fade-out.
-                if let Some((mut tail, sr)) = prev_tail.take() {
-                    let n = tail.len();
-                    fade_out(&mut tail, n);
-                    sink.append(SamplesBuffer::new(1, sr, tail));
-                }
-                break;
+                flush_tail(&sink, &mut prev_tail);
+                wait_for_sink(&sink, &cancelled);
+                return Ok(());
+            }
+            TtsCommand::Cancel => {
+                sink.stop();
+                return Ok(());
             }
         }
     }
+}
 
-    // Wait for all queued audio to finish playing.
-    sink.sleep_until_end();
-    Ok(())
+fn append_crossfaded_audio(
+    sink: &Sink,
+    prev_tail: &mut Option<(Vec<f32>, u32)>,
+    is_first_sentence: &mut bool,
+    mut samples: Vec<f32>,
+    sample_rate: u32,
+) {
+    let overlap = ((sample_rate as usize * CROSSFADE_MS) / 1000).min(samples.len());
+    if let Some((tail, _)) = prev_tail.take() {
+        crossfade_into(&tail, &mut samples, overlap);
+    } else if *is_first_sentence {
+        fade_in(&mut samples, overlap);
+        *is_first_sentence = false;
+    }
+    if samples.len() > overlap {
+        let tail = samples.split_off(samples.len() - overlap);
+        sink.append(SamplesBuffer::new(1, sample_rate, samples));
+        *prev_tail = Some((tail, sample_rate));
+    } else {
+        *prev_tail = Some((samples, sample_rate));
+    }
+}
+
+fn flush_tail(sink: &Sink, prev_tail: &mut Option<(Vec<f32>, u32)>) {
+    if let Some((mut tail, sample_rate)) = prev_tail.take() {
+        let len = tail.len();
+        fade_out(&mut tail, len);
+        sink.append(SamplesBuffer::new(1, sample_rate, tail));
+    }
 }
 
 /// TTS thread for voice cloning: blocking synthesis per sentence, with crossfade.
@@ -330,65 +461,58 @@ fn run_tts_clone_loop(
     rx: mpsc::Receiver<TtsCommand>,
     voice_clone: Option<crate::db::VoiceClone>,
     lang: Option<String>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
-    use qwen3_tts::AudioBuffer;
+    use crate::backend::{self, SpeakOptions};
 
     let vc = voice_clone.context("voice clone config missing")?;
-    let tts_lang = qwen_native::parse_language(lang.as_deref().unwrap_or("en"))?;
-
     let (_stream, stream_handle) =
         OutputStream::try_default().context("Failed to open audio output device")?;
     let sink = Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
-
+    let backend = backend::get_backend("qwen-native")?;
     let mut prev_tail: Option<(Vec<f32>, u32)> = None;
     let mut is_first_sentence = true;
 
-    for cmd in rx {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            sink.stop();
+            return Ok(());
+        }
+        let cmd = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         match cmd {
             TtsCommand::Speak(text) => {
-                qwen_native::with_model(None, |model| {
-                    let ref_audio = AudioBuffer::load(&vc.ref_audio).with_context(|| {
-                        format!("failed to load reference audio: {}", vc.ref_audio)
-                    })?;
-                    let prompt =
-                        model.create_voice_clone_prompt(&ref_audio, vc.ref_text.as_deref())?;
-                    let audio = model.synthesize_voice_clone(&text, &prompt, tts_lang, None)?;
-                    let sr = audio.sample_rate as u32;
-                    let mut samples = audio.samples;
-                    let overlap = ((sr as usize * CROSSFADE_MS) / 1000).min(samples.len());
-
-                    // Crossfade with previous sentence's tail.
-                    if let Some((tail, _)) = prev_tail.take() {
-                        crossfade_into(&tail, &mut samples, overlap);
-                    } else if is_first_sentence {
-                        fade_in(&mut samples, overlap);
-                        is_first_sentence = false;
-                    }
-
-                    // Hold back tail for crossfade with next sentence.
-                    if samples.len() > overlap {
-                        let split_at = samples.len() - overlap;
-                        let tail = samples.split_off(split_at);
-                        sink.append(SamplesBuffer::new(1, sr, samples));
-                        prev_tail = Some((tail, sr));
-                    } else {
-                        prev_tail = Some((samples, sr));
-                    }
-
-                    Ok(())
-                })?;
+                let opts = SpeakOptions {
+                    ref_audio: Some(vc.ref_audio.clone()),
+                    ref_text: vc.ref_text.clone(),
+                    lang: lang.clone(),
+                    ..Default::default()
+                };
+                let audio = backend.synthesize(&text, &opts)?;
+                if cancelled.load(Ordering::Acquire) {
+                    sink.stop();
+                    return Ok(());
+                }
+                append_crossfaded_audio(
+                    &sink,
+                    &mut prev_tail,
+                    &mut is_first_sentence,
+                    audio.samples,
+                    audio.sample_rate,
+                );
             }
             TtsCommand::Done => {
-                if let Some((mut tail, sr)) = prev_tail.take() {
-                    let n = tail.len();
-                    fade_out(&mut tail, n);
-                    sink.append(SamplesBuffer::new(1, sr, tail));
-                }
-                break;
+                flush_tail(&sink, &mut prev_tail);
+                wait_for_sink(&sink, &cancelled);
+                return Ok(());
+            }
+            TtsCommand::Cancel => {
+                sink.stop();
+                return Ok(());
             }
         }
     }
-
-    sink.sleep_until_end();
-    Ok(())
 }

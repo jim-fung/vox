@@ -76,3 +76,44 @@ fn test_validate_audio_no_extension() {
     let path = tmp.path().to_string_lossy().to_string();
     assert!(clone::validate_audio(&path).is_err());
 }
+
+// --- sanitize_clone_filename (review CL2 path-traversal fix) ---
+
+#[test]
+fn sanitize_strips_path_separators() {
+    assert_eq!(clone::sanitize_clone_filename("evil/../etc"), "evil_.._etc");
+    assert_eq!(clone::sanitize_clone_filename("a/b/c"), "a_b_c");
+    assert_eq!(clone::sanitize_clone_filename("C:\\Users\\x"), "C__Users_x");
+}
+
+#[test]
+fn sanitize_strips_leading_dots() {
+    // Path separators become _ first, then leading dots stripped.
+    assert_eq!(
+        clone::sanitize_clone_filename("../../../etc/passwd"),
+        "_.._.._etc_passwd"
+    );
+    assert_eq!(clone::sanitize_clone_filename(".hidden"), "hidden");
+}
+
+#[test]
+fn sanitize_replaces_null_and_control_chars() {
+    assert_eq!(clone::sanitize_clone_filename("clone\0evil"), "clone_evil");
+    assert_eq!(clone::sanitize_clone_filename("line\nbreak"), "line_break");
+}
+
+#[test]
+fn sanitize_preserves_normal_names() {
+    assert_eq!(clone::sanitize_clone_filename("patrick"), "patrick");
+    assert_eq!(clone::sanitize_clone_filename("voice_123"), "voice_123");
+    assert_eq!(
+        clone::sanitize_clone_filename("voix-française"),
+        "voix-française"
+    );
+}
+
+#[test]
+fn sanitize_handles_empty_and_all_dots() {
+    assert_eq!(clone::sanitize_clone_filename(""), "clone");
+    assert_eq!(clone::sanitize_clone_filename("..."), "clone");
+}

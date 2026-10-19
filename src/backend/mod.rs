@@ -21,7 +21,13 @@ pub struct SpeakOptions {
     pub voice: Option<String>,
     pub lang: Option<String>,
     pub rate: Option<u32>,
+    /// Reserved: accepted and validated by the CLI/MCP, but no backend currently
+    /// consumes this field. Wired up when a backend that supports gender control
+    /// is added (review B9).
     pub gender: Option<String>,
+    /// Reserved: accepted and validated by the CLI/MCP, but no backend currently
+    /// consumes this field. Wired up when a backend that supports intonation
+    /// styles is added (review B9).
     pub style: Option<String>,
     pub ref_audio: Option<String>,
     pub ref_text: Option<String>,
@@ -45,9 +51,37 @@ impl Default for SpeakOptions {
     }
 }
 
+/// In-memory mono f32 PCM audio produced by [`TtsBackend::synthesize`].
+///
+/// Backends that can expose their generated samples implement `synthesize`; the
+/// shared playback layer applies gain and sends this buffer to the audio device.
+#[derive(Debug, Clone)]
+pub struct AudioBuffer {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
 pub trait TtsBackend {
     fn name(&self) -> &str;
+
+    /// Speak text aloud, blocking until playback ends. Required because some
+    /// backends (`say`, qwen-py) have optimized playback paths that cannot be
+    /// represented as a complete in-memory buffer.
     fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()>;
+
+    /// Synthesize text into an in-memory buffer without playing it.
+    ///
+    /// The default reports that buffer synthesis is unsupported. Backends that
+    /// produce PCM samples (piper, pocket, qwen-native, kokoro, voxtream)
+    /// override it; callers such as streaming chat can then stay within the
+    /// backend abstraction instead of reaching into backend internals.
+    fn synthesize(&self, _text: &str, _opts: &SpeakOptions) -> Result<AudioBuffer> {
+        anyhow::bail!(
+            "backend '{}' does not support buffer synthesis; it can only speak",
+            self.name()
+        )
+    }
+
     fn list_voices(&self) -> Result<Vec<String>>;
     fn is_available(&self) -> bool;
 }

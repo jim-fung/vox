@@ -5283,6 +5283,7 @@ dependencies = [
  "pocket-tts",
  "predicates",
  "qwen3-tts",
+ "rand 0.8.6",
  "ratatui",
  "reqwest",
  "rodio",

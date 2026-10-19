@@ -4,12 +4,14 @@
 //! Model is loaded once and kept warm in a global Mutex for the process lifetime.
 //! Supports voice cloning via reference audio + text prompt.
 
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use qwen3_tts::{AudioBuffer, Language, ModelPaths, Qwen3TTS};
+// Alias to avoid colliding with vox's own `AudioBuffer` (backend/mod.rs).
+use qwen3_tts::{AudioBuffer as Q3tAudioBuffer, Language, ModelPaths, Qwen3TTS, Speaker};
 
-use super::{SpeakOptions, TtsBackend};
+use super::{AudioBuffer, SpeakOptions, TtsBackend};
 use crate::audio;
 
 const DEFAULT_MODEL: &str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base";
@@ -79,51 +81,63 @@ pub fn parse_language(code: &str) -> Result<Language> {
     }
 }
 
+pub fn parse_speaker(name: &str) -> Result<Speaker> {
+    Speaker::from_str(name).with_context(|| format!("unsupported qwen-native voice: {name}"))
+}
+
 impl TtsBackend for QwenNativeBackend {
     fn name(&self) -> &str {
         "qwen-native"
     }
 
-    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+    fn synthesize(&self, text: &str, opts: &SpeakOptions) -> Result<AudioBuffer> {
         let lang = parse_language(opts.lang.as_deref().unwrap_or("en"))?;
         let ref_audio_path = opts.ref_audio.clone();
         let ref_text = opts.ref_text.clone();
+        let speaker = match opts.voice.as_deref() {
+            Some(name) => parse_speaker(name)?,
+            None => Speaker::Ryan,
+        };
 
-        let mut audio_buf = with_model(opts.model.as_deref(), |model| {
+        let audio_buf: Q3tAudioBuffer = with_model(opts.model.as_deref(), |model| {
             if let Some(ref path) = ref_audio_path {
-                let ref_audio = AudioBuffer::load(path)
+                let ref_audio = Q3tAudioBuffer::load(path)
                     .with_context(|| format!("failed to load reference audio: {path}"))?;
                 let prompt = model.create_voice_clone_prompt(&ref_audio, ref_text.as_deref())?;
                 Ok(model.synthesize_voice_clone(text, &prompt, lang, None)?)
             } else {
-                Ok(model.synthesize(text, None)?)
+                // `synthesize` hardcodes English, so select the configured
+                // preset voice explicitly to preserve both language and voice.
+                Ok(model.synthesize_with_voice(text, speaker, lang, None)?)
             }
         })?;
 
-        // Apply volume gain to audio buffer
-        if (opts.volume - 1.0).abs() > f32::EPSILON {
-            for sample in &mut audio_buf.samples {
-                *sample = (*sample * opts.volume).clamp(-1.0, 1.0);
-            }
-        }
+        Ok(AudioBuffer {
+            samples: audio_buf.samples,
+            sample_rate: audio_buf.sample_rate,
+        })
+    }
 
-        // Save to temp file and play with rodio
-        let tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-        let wav_path = tmp.path().with_extension("wav");
-        audio_buf
-            .save(&wav_path)
-            .context("failed to save generated audio")?;
-
-        audio::play_wav_blocking(&wav_path)?;
-
-        let _ = std::fs::remove_file(&wav_path);
-
-        Ok(())
+    fn speak(&self, text: &str, opts: &SpeakOptions) -> Result<()> {
+        // Volume is applied uniformly in audio::play (previously done in-memory
+        // here; now centralized for all buffer backends).
+        let buffer = self.synthesize(text, opts)?;
+        audio::play(&buffer, opts.volume)
     }
 
     fn list_voices(&self) -> Result<Vec<String>> {
-        // Base model doesn't have preset voices — voice cloning is the way
-        Ok(vec!["(use voice clones with --voice)".into()])
+        Ok(vec![
+            "Serena".into(),
+            "Vivian".into(),
+            "UncleFu".into(),
+            "Ryan".into(),
+            "Aiden".into(),
+            "OnoAnna".into(),
+            "Sohee".into(),
+            "Eric".into(),
+            "Dylan".into(),
+            "(or use a saved voice clone)".into(),
+        ])
     }
 
     fn is_available(&self) -> bool {

@@ -1,5 +1,5 @@
 use vox::backend::TtsBackend;
-use vox::backend::qwen_native::{QwenNativeBackend, parse_language};
+use vox::backend::qwen_native::{QwenNativeBackend, parse_language, parse_speaker};
 
 #[test]
 fn test_qwen_native_name() {
@@ -11,7 +11,7 @@ fn test_qwen_native_name() {
 fn test_qwen_native_list_voices() {
     let backend = QwenNativeBackend;
     let voices = backend.list_voices().unwrap();
-    assert_eq!(voices.len(), 1);
+    assert!(voices.contains(&"Ryan".to_string()));
 }
 
 #[test]
@@ -39,4 +39,18 @@ fn test_parse_language_unsupported() {
     assert!(parse_language("ar").is_err());
     assert!(parse_language("nl").is_err());
     assert!(parse_language("xx").is_err());
+}
+
+#[test]
+fn test_parse_speaker_valid() {
+    assert!(parse_speaker("Ryan").is_ok());
+    assert!(parse_speaker("serena").is_ok());
+    assert!(parse_speaker("UncleFu").is_ok());
+    assert!(parse_speaker("ono_anna").is_ok());
+}
+
+#[test]
+fn test_parse_speaker_invalid() {
+    assert!(parse_speaker("unknown").is_err());
+    assert!(parse_speaker("").is_err());
 }

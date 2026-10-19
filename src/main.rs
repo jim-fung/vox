@@ -57,6 +57,11 @@ struct Cli {
     #[arg(long)]
     list_voices: bool,
 
+    /// Do not auto-start or route through the daemon (run in-process).
+    /// Also honored via the VOX_NO_DAEMON=1 environment variable.
+    #[arg(long)]
+    no_daemon: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -100,7 +105,7 @@ enum Commands {
     /// Start a voice conversation with Claude (macOS only)
     #[cfg(target_os = "macos")]
     Chat {
-        /// Voice clone name
+        /// Voice name or clone name
         #[arg(short = 'v', long)]
         voice: Option<String>,
         /// Language code
@@ -257,25 +262,14 @@ fn main() -> Result<()> {
     }
 }
 
-/// The backend to use for voice cloning (auto-detected by platform).
-fn voice_clone_backend() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "qwen"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "qwen-native"
-    }
-}
-
 fn handle_speak(cli: Cli) -> Result<()> {
     let conn = db::open()?;
     let prefs = db::get_preferences(&conn)?;
 
+    // --list-voices is a pure query: resolve the backend (honoring CLI > prefs >
+    // default, same as speak) but never synthesize. Handle it before the shared
+    // resolver, which dispatches audio.
     let lang = cli.lang.clone().or(prefs.lang);
-
-    // Merge: CLI flags > DB preferences > language-aware defaults
     let backend_name = if cli.backend != DEFAULT_BACKEND {
         cli.backend.clone()
     } else {
@@ -283,35 +277,9 @@ fn handle_speak(cli: Cli) -> Result<()> {
             .backend
             .unwrap_or_else(|| config::default_backend_for_lang(lang.as_deref()).to_string())
     };
-
-    let mut voice = cli.voice.or(prefs.voice);
-    let rate = cli.rate.or(prefs.rate);
-    let gender = cli.gender.or(prefs.gender);
-    let style = cli.style.or(prefs.style);
-    let model = cli.model.or(prefs.model);
-
-    // Resolve voice clone
-    let mut ref_audio = None;
-    let mut ref_text = None;
-    let mut effective_backend = backend_name.clone();
-
-    if let Some(ref voice_name) = voice
-        && let Some(vc) = clone::resolve_voice(&conn, voice_name)?
-    {
-        ref_audio = Some(vc.ref_audio);
-        ref_text = vc.ref_text;
-        // Auto-switch to a clone-capable backend (unless already on one)
-        if !["qwen", "qwen-native", "voxtream", "pocket"].contains(&effective_backend.as_str()) {
-            effective_backend = voice_clone_backend().to_string();
-        }
-        voice = None; // don't pass clone name as --voice
-    }
-
-    let backend = backend::get_backend(&effective_backend)?;
-
     if cli.list_voices {
-        let voices = backend.list_voices()?;
-        for v in &voices {
+        let backend = backend::get_backend(&backend_name)?;
+        for v in &backend.list_voices()? {
             println!("{v}");
         }
         return Ok(());
@@ -319,42 +287,23 @@ fn handle_speak(cli: Cli) -> Result<()> {
 
     let text = input::read_text(&cli.text)?;
 
-    let opts = SpeakOptions {
-        voice,
-        lang: lang.clone(),
-        rate,
-        gender,
-        style,
-        ref_audio,
-        ref_text,
-        model,
-        volume: cli.volume,
+    // Delegate resolution + dispatch + logging to the shared core. The CLI is now
+    // just input parsing (above) and the --no-daemon routing decision.
+    let input = vox::speak::SpeakInput {
+        text,
+        backend_override: (cli.backend != DEFAULT_BACKEND).then(|| cli.backend.clone()),
+        voice: cli.voice,
+        lang: cli.lang,
+        rate: cli.rate,
+        gender: cli.gender,
+        style: cli.style,
+        model: cli.model,
+        volume: Some(cli.volume),
     };
-
-    let start = Instant::now();
-
-    // Try daemon for heavy backends (warm model = fast inference)
-    let is_heavy = matches!(
-        effective_backend.as_str(),
-        "voxtream" | "qwen" | "qwen-native" | "kokoro" | "pocket"
-    );
-    if is_heavy && daemon::is_running() {
-        daemon::speak_via_daemon(&text, &effective_backend, &opts)?;
-    } else {
-        backend.speak(&text, &opts)?;
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    // Log usage
-    let _ = db::log_usage(
-        &conn,
-        &effective_backend,
-        opts.voice.as_deref(),
-        opts.lang.as_deref(),
-        text.len(),
-        Some(duration_ms),
-    );
+    let route = vox::speak::SpeakRouteOpts {
+        allow_daemon: !cli.no_daemon,
+    };
+    vox::speak::resolve_and_speak(&conn, input, route)?;
 
     Ok(())
 }
@@ -457,7 +406,7 @@ fn handle_chat(voice: Option<String>, lang: Option<String>) -> Result<()> {
     let prefs = db::get_preferences(&conn)?;
 
     let voice_name = voice.or(prefs.voice);
-    let lang = lang.or(prefs.lang);
+    let lang = lang.or(prefs.lang).or_else(config::system_lang);
 
     let voice_clone = if let Some(ref name) = voice_name {
         clone::resolve_voice(&conn, name)?
@@ -467,6 +416,7 @@ fn handle_chat(voice: Option<String>, lang: Option<String>) -> Result<()> {
 
     let config = ChatConfig {
         voice_clone,
+        voice: voice_name,
         lang,
         api_key,
         model: "claude-sonnet-4-20250514".to_string(),

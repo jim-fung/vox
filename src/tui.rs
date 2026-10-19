@@ -31,7 +31,10 @@ const VOLUME_PRESETS: &[&str] = &["0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "3
 
 struct App {
     screen: Screen,
-    backends: Vec<&'static str>,
+    /// (backend name, display label). Tuples replace the old stringly-typed rows
+    /// that were parsed via split_whitespace — see R5 (review A8). Also includes
+    /// `pocket` (the default backend) which was previously missing from the TUI.
+    backends: Vec<(&'static str, &'static str)>,
     backend_idx: usize,
     voices: Vec<String>,
     voice_idx: usize,
@@ -50,24 +53,56 @@ impl App {
         let prefs = db::get_preferences(&conn)?;
 
         #[cfg(target_os = "macos")]
-        let backends = vec![
-            "say          \u{2605}\u{2605}\u{2605} quality  \u{26a1} 3s",
-            "piper        \u{2605}\u{2605}  quality  \u{26a1} <1s  [Rust]",
-            "qwen-native  \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 12s  [Rust+Metal]",
-            "voxtream     \u{2605}\u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 170ms [CUDA]",
-            "qwen         \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 2s   [Python+MLX]",
+        let backends: Vec<(&'static str, &'static str)> = vec![
+            (
+                "say",
+                "say          \u{2605}\u{2605}\u{2605} quality  \u{26a1} 3s",
+            ),
+            (
+                "piper",
+                "piper        \u{2605}\u{2605}  quality  \u{26a1} <1s  [Rust]",
+            ),
+            (
+                "pocket",
+                "pocket       \u{2605}\u{2605}\u{2605}  quality  \u{26a1} ~2s  [Rust CPU]",
+            ),
+            (
+                "qwen-native",
+                "qwen-native  \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 12s  [Rust+Metal]",
+            ),
+            (
+                "voxtream",
+                "voxtream     \u{2605}\u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 170ms [CUDA]",
+            ),
+            (
+                "qwen",
+                "qwen         \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 2s   [Python+MLX]",
+            ),
         ];
         #[cfg(not(target_os = "macos"))]
-        let backends = vec![
-            "piper        \u{2605}\u{2605}  quality  \u{26a1} <1s  [Rust]",
-            "qwen-native  \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 3s   [Rust+CUDA]",
-            "voxtream     \u{2605}\u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 170ms [CUDA]",
+        let backends: Vec<(&'static str, &'static str)> = vec![
+            (
+                "piper",
+                "piper        \u{2605}\u{2605}  quality  \u{26a1} <1s  [Rust]",
+            ),
+            (
+                "pocket",
+                "pocket       \u{2605}\u{2605}\u{2605}  quality  \u{26a1} ~2s  [Rust CPU]",
+            ),
+            (
+                "qwen-native",
+                "qwen-native  \u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 3s   [Rust+CUDA]",
+            ),
+            (
+                "voxtream",
+                "voxtream     \u{2605}\u{2605}\u{2605}\u{2605}\u{2605} quality  \u{26a1} 170ms [CUDA]",
+            ),
         ];
 
         let current_backend = prefs.backend.as_deref().unwrap_or(config::DEFAULT_BACKEND);
         let backend_idx = backends
             .iter()
-            .position(|b| b.split_whitespace().next() == Some(current_backend))
+            .position(|(name, _)| *name == current_backend)
             .unwrap_or(0);
 
         let languages: Vec<&str> = config::SUPPORTED_LANGS.to_vec();
@@ -92,7 +127,7 @@ impl App {
             .and_then(|s| styles.iter().position(|x| *x == s))
             .unwrap_or(0);
 
-        let voices = Self::load_voices(backends[backend_idx]);
+        let voices = Self::load_voices(backends[backend_idx].0);
 
         let voice_idx = prefs
             .voice
@@ -125,11 +160,7 @@ impl App {
     }
 
     fn selected_backend(&self) -> &str {
-        // Extract backend name (first word before spaces)
-        self.backends[self.backend_idx]
-            .split_whitespace()
-            .next()
-            .unwrap_or("say")
+        self.backends[self.backend_idx].0
     }
 
     fn selected_lang(&self) -> &str {
@@ -176,10 +207,7 @@ impl App {
         match self.screen {
             Screen::Backend => {
                 self.backend_idx = idx;
-                let name = self.backends[idx]
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("say");
+                let name = self.backends[idx].0;
                 self.voices = Self::load_voices(name);
                 self.voice_idx = 0;
             }
@@ -330,8 +358,8 @@ fn draw(frame: &mut Frame, app: &App) {
     ])
     .split(outer[1]);
 
-    // Backend list
-    let backend_items: Vec<&str> = app.backends.to_vec();
+    // Backend list — render the display labels (.1), keyed by name (.0).
+    let backend_items: Vec<&str> = app.backends.iter().map(|(_, label)| *label).collect();
     frame.render_widget(
         render_list(
             "Backend",
